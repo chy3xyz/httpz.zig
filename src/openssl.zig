@@ -9,7 +9,7 @@ const Io = std.Io;
 const mem = std.mem;
 const posix = std.posix;
 
-const c = @cImport({
+pub const c = @cImport({
     @cInclude("openssl/ssl.h");
     @cInclude("openssl/err.h");
     @cInclude("openssl/x509.h");
@@ -17,20 +17,7 @@ const c = @cImport({
     @cInclude("openssl/pem.h");
 });
 
-/// Simple spinlock mutex for protecting shared state.
-const SpinMutex = struct {
-    state: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-
-    pub fn lock(self: *SpinMutex) void {
-        while (self.state.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
-            std.atomic.spinLoopHint();
-        }
-    }
-
-    pub fn unlock(self: *SpinMutex) void {
-        self.state.store(0, .release);
-    }
-};
+const Mutex = std.atomic.Mutex;
 
 /// Buffer sizes matching TLS record sizes. These are kept for API
 /// compatibility — they size the Io.Reader/Writer buffers, not
@@ -363,7 +350,7 @@ pub const SniContext = struct {
     default_ctx: *c.SSL_CTX,
     domain_contexts: std.StringHashMap(*c.SSL_CTX),
     allocator: std.mem.Allocator,
-    mutex: SpinMutex,
+    mutex: Mutex,
 
     pub fn init(allocator: std.mem.Allocator, default_cert: *const config.CertKeyPair) !SniContext {
         const ctx = c.SSL_CTX_new(c.TLS_server_method()) orelse return error.TlsHandshakeFailure;
@@ -378,7 +365,7 @@ pub const SniContext = struct {
             .default_ctx = ctx,
             .domain_contexts = std.StringHashMap(*c.SSL_CTX).init(allocator),
             .allocator = allocator,
-            .mutex = .{},
+            .mutex = .unlocked,
         };
 
         // Register the SNI callback on the default context
@@ -412,7 +399,7 @@ pub const SniContext = struct {
         try loadCertIntoCtx(ctx, cert_pem, key_pem);
         c.SSL_CTX_set_alpn_select_cb(ctx, alpnSelectCallback, null);
 
-        self.mutex.lock();
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
 
         // Replace existing entry if present
@@ -428,7 +415,7 @@ pub const SniContext = struct {
 
     /// Remove a domain's TLS certificate.
     pub fn removeDomain(self: *SniContext, domain: []const u8) void {
-        self.mutex.lock();
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
 
         if (self.domain_contexts.fetchRemove(domain)) |old| {
@@ -450,7 +437,7 @@ pub const SniContext = struct {
 
 /// SNI callback — called by OpenSSL during TLS handshake to select the
 /// correct SSL_CTX based on the client's requested hostname.
-fn sniCallbackFn(
+pub fn sniCallbackFn(
     ssl: ?*c.SSL,
     _: ?*c_int,
     arg: ?*anyopaque,
@@ -461,7 +448,7 @@ fn sniCallbackFn(
 
     const hostname = mem.sliceTo(hostname_ptr, 0);
 
-    sni_ctx.mutex.lock();
+    while (!sni_ctx.mutex.tryLock()) std.atomic.spinLoopHint();
     defer sni_ctx.mutex.unlock();
 
     if (sni_ctx.domain_contexts.get(hostname)) |domain_ctx| {
@@ -472,7 +459,7 @@ fn sniCallbackFn(
 }
 
 /// Load a certificate chain and private key into an SSL_CTX.
-fn loadCertIntoCtx(ctx: *c.SSL_CTX, cert_pem: []const u8, key_pem: []const u8) !void {
+pub fn loadCertIntoCtx(ctx: *c.SSL_CTX, cert_pem: []const u8, key_pem: []const u8) !void {
     // Load certificate chain
     const cert_bio = c.BIO_new_mem_buf(@ptrCast(cert_pem.ptr), @intCast(cert_pem.len)) orelse return error.InvalidCertificate;
     defer _ = c.BIO_free(cert_bio);
@@ -615,4 +602,9 @@ fn sslToError(ssl_error: c_int) anyerror {
         c.SSL_ERROR_SSL => error.TlsAlert,
         else => error.ReadFailed,
     };
+}
+
+test {
+    @import("std").testing.refAllDecls(@This());
+    _ = @import("openssl_test.zig");
 }
