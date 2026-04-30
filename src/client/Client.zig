@@ -144,10 +144,6 @@ pub fn connect(self: *Client, io: Io) ClientError!void {
         return error.ConnectionFailed;
     };
 
-    if (self.config.connection_timeout_s > 0) {
-        setSocketTimeout(stream.socket.handle, self.config.connection_timeout_s);
-    }
-
     if (self.config.tls_config) |tls_config| {
         // OpenSSL uses the socket fd directly
         self.tls_conn = tls.client(stream.socket.handle, tls_config) catch {
