@@ -159,12 +159,24 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
     var net_writer = Io.net.Stream.Writer.init(stream, io, &write_buf);
 
     if (self.config.tls_config) |tls_config| {
-        // Peek at the first byte to detect plain HTTP on a TLS port.
+        // Peek at the first byte to detect plain HTTP vs TLS.
         // Use MSG_PEEK at the socket level so the byte remains available
         // to OpenSSL for the handshake.
         var peek_buf: [1]u8 = undefined;
         const peek_result = std.posix.system.recvfrom(fd, &peek_buf, 1, std.os.linux.MSG.PEEK, null, null);
-        if (peek_result > 0 and peek_buf[0] != 0x16) {
+        const is_tls_client_hello = peek_result > 0 and peek_buf[0] == 0x16;
+
+        if (is_tls_client_hello) {
+            // Client is speaking TLS — perform handshake (with SNI if configured)
+            tls_conn = tls.server(fd, tls_config) catch {
+                return;
+            };
+        } else if (tls_config.sni_context != null) {
+            // SNI mode: accept plain HTTP alongside TLS (e.g., from a reverse
+            // proxy like Traefik that terminates TLS for the primary domain
+            // and forwards plain HTTP to this port).
+        } else {
+            // Strict TLS mode — reject plain HTTP
             net_writer.interface.writeAll(
                 "HTTP/1.1 400 Bad Request\r\n" ++
                     "Content-Type: text/plain\r\n" ++
@@ -176,10 +188,6 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
             net_writer.interface.flush() catch {};
             return;
         }
-
-        tls_conn = tls.server(fd, tls_config) catch {
-            return;
-        };
     }
     defer if (tls_conn) |*tc| {
         tc.close() catch {};

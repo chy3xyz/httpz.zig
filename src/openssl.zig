@@ -17,6 +17,21 @@ const c = @cImport({
     @cInclude("openssl/pem.h");
 });
 
+/// Simple spinlock mutex for protecting shared state.
+const SpinMutex = struct {
+    state: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    pub fn lock(self: *SpinMutex) void {
+        while (self.state.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    pub fn unlock(self: *SpinMutex) void {
+        self.state.store(0, .release);
+    }
+};
+
 /// Buffer sizes matching TLS record sizes. These are kept for API
 /// compatibility — they size the Io.Reader/Writer buffers, not
 /// OpenSSL's internal buffers.
@@ -26,6 +41,10 @@ pub const output_buffer_len = 16469;
 // SSL_set_tlsext_host_name is a C macro — replicate its constant here.
 const SSL_CTRL_SET_TLSEXT_HOSTNAME: c_int = 55;
 const TLSEXT_NAMETYPE_host_name: c_long = 0;
+
+// SSL_CTX_set_tlsext_servername_callback is a C macro — use the underlying ctrl constant.
+const SSL_CTRL_SET_TLSEXT_SERVERNAME_CB: c_int = 53;
+const SSL_CTRL_SET_TLSEXT_SERVERNAME_CB_ARG: c_int = 54;
 
 pub const config = struct {
     pub const cert = struct {
@@ -109,6 +128,10 @@ pub const config = struct {
         auth: ?*const CertKeyPair = null,
         /// ALPN protocol names supported by the server, in preference order.
         alpn_protocols: []const []const u8 = &.{},
+        /// SNI context for per-domain certificate selection.
+        /// When set, uses a shared SSL_CTX with an SNI callback instead of
+        /// creating a new SSL_CTX per connection.
+        sni_context: ?*SniContext = null,
     };
 };
 
@@ -117,6 +140,9 @@ pub const Connection = struct {
     ctx: *c.SSL_CTX,
     /// ALPN protocol negotiated during TLS handshake (e.g., "h2", "http/1.1").
     alpn_protocol: ?[]const u8 = null,
+    /// Whether this connection owns (and should free) its SSL_CTX.
+    /// False when using a shared SniContext.
+    owns_ctx: bool = true,
     /// Read buffer — must outlive the returned slice from next().
     read_buf: [16384]u8 = undefined,
 
@@ -164,10 +190,12 @@ pub const Connection = struct {
         _ = c.SSL_shutdown(conn.ssl);
     }
 
-    /// Free the SSL and SSL_CTX objects.
+    /// Free the SSL object and, if owned, the SSL_CTX.
     pub fn deinit(conn: *Connection) void {
         c.SSL_free(conn.ssl);
-        c.SSL_CTX_free(conn.ctx);
+        if (conn.owns_ctx) {
+            c.SSL_CTX_free(conn.ctx);
+        }
     }
 
     // -- Io.Reader interface --
@@ -329,52 +357,179 @@ pub fn client(fd: posix.fd_t, opts: config.Client) !Connection {
     };
 }
 
-/// Perform a TLS server handshake on the given socket fd.
-pub fn server(fd: posix.fd_t, opts: config.Server) !Connection {
-    const ctx = c.SSL_CTX_new(c.TLS_server_method()) orelse return error.TlsHandshakeFailure;
-    errdefer c.SSL_CTX_free(ctx);
+/// SNI context for per-domain certificate selection.
+/// Holds a default SSL_CTX and a map of domain → SSL_CTX for custom certs.
+pub const SniContext = struct {
+    default_ctx: *c.SSL_CTX,
+    domain_contexts: std.StringHashMap(*c.SSL_CTX),
+    allocator: std.mem.Allocator,
+    mutex: SpinMutex,
 
-    // Load certificate and private key from PEM data in memory
-    if (opts.auth) |auth| {
-        // Load certificate chain
-        const cert_bio = c.BIO_new_mem_buf(@ptrCast(auth.cert_pem.ptr), @intCast(auth.cert_pem.len)) orelse return error.InvalidCertificate;
-        defer _ = c.BIO_free(cert_bio);
+    pub fn init(allocator: std.mem.Allocator, default_cert: *const config.CertKeyPair) !SniContext {
+        const ctx = c.SSL_CTX_new(c.TLS_server_method()) orelse return error.TlsHandshakeFailure;
+        errdefer c.SSL_CTX_free(ctx);
 
-        const cert_x509 = c.PEM_read_bio_X509(cert_bio, null, null, null) orelse return error.InvalidCertificate;
-        if (c.SSL_CTX_use_certificate(ctx, cert_x509) != 1) {
-            c.X509_free(cert_x509);
-            return error.InvalidCertificate;
+        try loadCertIntoCtx(ctx, default_cert.cert_pem, default_cert.key_pem);
+
+        // ALPN callback
+        c.SSL_CTX_set_alpn_select_cb(ctx, alpnSelectCallback, null);
+
+        var sni = SniContext{
+            .default_ctx = ctx,
+            .domain_contexts = std.StringHashMap(*c.SSL_CTX).init(allocator),
+            .allocator = allocator,
+            .mutex = .{},
+        };
+
+        // Register the SNI callback on the default context
+        sni.installSniCallback();
+
+        return sni;
+    }
+
+    fn installSniCallback(self: *SniContext) void {
+        // SSL_CTX_set_tlsext_servername_callback is a C macro that Zig can't
+        // translate. Use SSL_CTX_callback_ctrl with the underlying control code.
+        _ = c.SSL_CTX_callback_ctrl(
+            self.default_ctx,
+            SSL_CTRL_SET_TLSEXT_SERVERNAME_CB,
+            @ptrCast(&sniCallbackFn),
+        );
+        // Set the arg pointer to this SniContext
+        _ = c.SSL_CTX_ctrl(
+            self.default_ctx,
+            SSL_CTRL_SET_TLSEXT_SERVERNAME_CB_ARG,
+            0,
+            @ptrCast(self),
+        );
+    }
+
+    /// Add or replace a domain's TLS certificate.
+    pub fn addDomain(self: *SniContext, domain: []const u8, cert_pem: []const u8, key_pem: []const u8) !void {
+        const ctx = c.SSL_CTX_new(c.TLS_server_method()) orelse return error.TlsHandshakeFailure;
+        errdefer c.SSL_CTX_free(ctx);
+
+        try loadCertIntoCtx(ctx, cert_pem, key_pem);
+        c.SSL_CTX_set_alpn_select_cb(ctx, alpnSelectCallback, null);
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // Replace existing entry if present
+        if (self.domain_contexts.fetchRemove(domain)) |old| {
+            c.SSL_CTX_free(old.value);
+            self.allocator.free(old.key);
         }
-        c.X509_free(cert_x509);
 
-        // Load any additional chain certificates
-        while (true) {
-            const chain_cert = c.PEM_read_bio_X509(cert_bio, null, null, null);
-            if (chain_cert == null) break;
-            if (c.SSL_CTX_add_extra_chain_cert(ctx, chain_cert) != 1) {
-                c.X509_free(chain_cert);
-                break;
-            }
-            // Note: SSL_CTX_add_extra_chain_cert takes ownership, don't free
-        }
+        const owned_domain = try self.allocator.dupe(u8, domain);
+        errdefer self.allocator.free(owned_domain);
+        try self.domain_contexts.put(owned_domain, ctx);
+    }
 
-        // Load private key
-        const key_bio = c.BIO_new_mem_buf(@ptrCast(auth.key_pem.ptr), @intCast(auth.key_pem.len)) orelse return error.InvalidCertificate;
-        defer _ = c.BIO_free(key_bio);
+    /// Remove a domain's TLS certificate.
+    pub fn removeDomain(self: *SniContext, domain: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
 
-        const pkey = c.PEM_read_bio_PrivateKey(key_bio, null, null, null) orelse return error.InvalidCertificate;
-        defer c.EVP_PKEY_free(pkey);
-
-        if (c.SSL_CTX_use_PrivateKey(ctx, pkey) != 1) {
-            return error.InvalidCertificate;
-        }
-        if (c.SSL_CTX_check_private_key(ctx) != 1) {
-            return error.InvalidCertificate;
+        if (self.domain_contexts.fetchRemove(domain)) |old| {
+            c.SSL_CTX_free(old.value);
+            self.allocator.free(old.key);
         }
     }
 
-    // ALPN callback
-    c.SSL_CTX_set_alpn_select_cb(ctx, alpnSelectCallback, null);
+    pub fn deinit(self: *SniContext) void {
+        var it = self.domain_contexts.iterator();
+        while (it.next()) |entry| {
+            c.SSL_CTX_free(entry.value_ptr.*);
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.domain_contexts.deinit();
+        c.SSL_CTX_free(self.default_ctx);
+    }
+};
+
+/// SNI callback — called by OpenSSL during TLS handshake to select the
+/// correct SSL_CTX based on the client's requested hostname.
+fn sniCallbackFn(
+    ssl: ?*c.SSL,
+    _: ?*c_int,
+    arg: ?*anyopaque,
+) callconv(.c) c_int {
+    const sni_ctx: *SniContext = @ptrCast(@alignCast(arg orelse return c.SSL_TLSEXT_ERR_OK));
+    const hostname_ptr = c.SSL_get_servername(ssl, @intCast(TLSEXT_NAMETYPE_host_name));
+    if (hostname_ptr == null) return c.SSL_TLSEXT_ERR_OK;
+
+    const hostname = mem.sliceTo(hostname_ptr, 0);
+
+    sni_ctx.mutex.lock();
+    defer sni_ctx.mutex.unlock();
+
+    if (sni_ctx.domain_contexts.get(hostname)) |domain_ctx| {
+        _ = c.SSL_set_SSL_CTX(ssl, domain_ctx);
+    }
+    // If not found, the default_ctx cert is used (already set)
+    return c.SSL_TLSEXT_ERR_OK;
+}
+
+/// Load a certificate chain and private key into an SSL_CTX.
+fn loadCertIntoCtx(ctx: *c.SSL_CTX, cert_pem: []const u8, key_pem: []const u8) !void {
+    // Load certificate chain
+    const cert_bio = c.BIO_new_mem_buf(@ptrCast(cert_pem.ptr), @intCast(cert_pem.len)) orelse return error.InvalidCertificate;
+    defer _ = c.BIO_free(cert_bio);
+
+    const cert_x509 = c.PEM_read_bio_X509(cert_bio, null, null, null) orelse return error.InvalidCertificate;
+    if (c.SSL_CTX_use_certificate(ctx, cert_x509) != 1) {
+        c.X509_free(cert_x509);
+        return error.InvalidCertificate;
+    }
+    c.X509_free(cert_x509);
+
+    // Load any additional chain certificates
+    while (true) {
+        const chain_cert = c.PEM_read_bio_X509(cert_bio, null, null, null);
+        if (chain_cert == null) break;
+        if (c.SSL_CTX_add_extra_chain_cert(ctx, chain_cert) != 1) {
+            c.X509_free(chain_cert);
+            break;
+        }
+        // Note: SSL_CTX_add_extra_chain_cert takes ownership, don't free
+    }
+
+    // Load private key
+    const key_bio = c.BIO_new_mem_buf(@ptrCast(key_pem.ptr), @intCast(key_pem.len)) orelse return error.InvalidCertificate;
+    defer _ = c.BIO_free(key_bio);
+
+    const pkey = c.PEM_read_bio_PrivateKey(key_bio, null, null, null) orelse return error.InvalidCertificate;
+    defer c.EVP_PKEY_free(pkey);
+
+    if (c.SSL_CTX_use_PrivateKey(ctx, pkey) != 1) {
+        return error.InvalidCertificate;
+    }
+    if (c.SSL_CTX_check_private_key(ctx) != 1) {
+        return error.InvalidCertificate;
+    }
+}
+
+/// Perform a TLS server handshake on the given socket fd.
+pub fn server(fd: posix.fd_t, opts: config.Server) !Connection {
+    // When an SniContext is available, use its shared default_ctx
+    // (with SNI callback already registered). Otherwise create a
+    // new per-connection SSL_CTX as before.
+    var owned_ctx: ?*c.SSL_CTX = null;
+    const ctx = if (opts.sni_context) |sni| sni.default_ctx else blk: {
+        const new_ctx = c.SSL_CTX_new(c.TLS_server_method()) orelse return error.TlsHandshakeFailure;
+        owned_ctx = new_ctx;
+        errdefer c.SSL_CTX_free(new_ctx);
+
+        if (opts.auth) |auth| {
+            try loadCertIntoCtx(new_ctx, auth.cert_pem, auth.key_pem);
+        }
+
+        // ALPN callback
+        c.SSL_CTX_set_alpn_select_cb(new_ctx, alpnSelectCallback, null);
+        break :blk new_ctx;
+    };
+    errdefer if (owned_ctx) |oc| c.SSL_CTX_free(oc);
 
     const ssl = c.SSL_new(ctx) orelse return error.TlsHandshakeFailure;
     errdefer c.SSL_free(ssl);
@@ -399,6 +554,7 @@ pub fn server(fd: posix.fd_t, opts: config.Server) !Connection {
         .ssl = ssl,
         .ctx = ctx,
         .alpn_protocol = negotiated_alpn,
+        .owns_ctx = owned_ctx != null,
     };
 }
 

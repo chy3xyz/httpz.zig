@@ -11,6 +11,7 @@ pub fn build(b: *std.Build) void {
     });
     httpz_mod.linkSystemLibrary("ssl", .{});
     httpz_mod.linkSystemLibrary("crypto", .{});
+    httpz_mod.link_libc = true;
 
     // Example executables
     const examples = [_][]const u8{
