@@ -5,13 +5,23 @@ const Response = @import("Response.zig");
 const Connection = @import("server/Connection.zig");
 const WebSocket = @import("server/WebSocket.zig");
 
-// Pattern syntax supported by `matchPath`:
-//   literal    — matches one path segment exactly (`/users`)
-//   :name      — matches a single path segment and captures it as `name`
-//   *name      — catch-all: must be the last segment; matches the rest of the
-//                path (possibly empty) and captures it as `name`. Requires the
-//                prefix to be followed by `/` in the request path, i.e.
-//                `/foo/*rest` matches `/foo/` and `/foo/bar/baz` but not `/foo`.
+// Pattern syntax supported by the dispatcher:
+//   literal      — matches one path segment exactly (`/users`)
+//   :name        — matches a single path segment and captures it as `name`
+//   *name        — catch-all: must be the last segment; matches the rest of the
+//                  path (possibly empty) and captures it as `name`. Requires the
+//                  prefix to be followed by `/` in the request path, i.e.
+//                  `/foo/*rest` matches `/foo/` and `/foo/bar/baz` but not `/foo`.
+//   :verb suffix — AIP-136 Action attached to the last segment (e.g.
+//                  `/users/:id:archive`). A non-leading `:` on the last segment
+//                  introduces an Action. Action names must match
+//                  [A-Za-z][A-Za-z0-9]*. Not allowed on catch-all segments.
+//                  Routes match on the (method, path, action) triple — a Route
+//                  with no Action does not match a URL with one, and vice
+//                  versa. AIP-136 requires custom methods to use POST, so a
+//                  Route with an Action must declare `.method = .POST`
+//                  (enforced at comptime). The parsed Action is exposed as
+//                  `Request.action`.
 
 pub const Handler = Connection.Handler;
 
@@ -69,29 +79,120 @@ pub fn handler(comptime routes: []const Route) Connection.Handler {
 pub fn handlerWithFallback(comptime routes: []const Route, comptime not_found: Handler) Connection.Handler {
     return struct {
         fn dispatch(allocator: std.mem.Allocator, io: std.Io, request: *const Request) Response {
-            const path = extractPath(request.uri);
+            const raw_path = extractPath(request.uri);
+            const url_split = extractAction(raw_path);
+
+            var mutable_req = request.*;
+            mutable_req.action = url_split.action;
 
             inline for (routes) |route| {
+                const pattern_split = comptime parsePatternAction(route.path);
+                comptime if (pattern_split.action != null and route.method != .POST) {
+                    @compileError("AIP-136 action routes must use .method = .POST; pattern '" ++ route.path ++ "' has action '" ++ pattern_split.action.? ++ "' on method " ++ @tagName(route.method));
+                };
                 if (route.method.matches(request.method)) {
-                    if (matchPath(route.path, path)) |params| {
-                        var mutable_req = request.*;
-                        mutable_req.params = params;
-                        var response = route.handler(allocator, io, &mutable_req);
-                        if (route.ws) |ws| {
-                            response.ws_handler = ws.handler;
+                    if (actionEql(pattern_split.action, url_split.action)) {
+                        if (matchPath(pattern_split.path, url_split.path)) |params| {
+                            mutable_req.params = params;
+                            var response = route.handler(allocator, io, &mutable_req);
+                            if (route.ws) |ws| {
+                                response.ws_handler = ws.handler;
+                            }
+                            return response;
                         }
-                        return response;
                     }
                 }
             }
 
-            return not_found(allocator, io, request);
+            return not_found(allocator, io, &mutable_req);
         }
     }.dispatch;
 }
 
 fn defaultNotFound(_: std.mem.Allocator, _: std.Io, _: *const Request) Response {
     return Response.init(.not_found, "text/plain", "Not Found");
+}
+
+/// Result of splitting an AIP-136 Action off of a path or pattern.
+pub const ActionSplit = struct { path: []const u8, action: ?[]const u8 };
+
+/// Extract the AIP-136 Action from the last segment of a URL path at runtime.
+///
+/// Returns the path with the `:action` suffix removed and the Action name.
+/// Recognized only when the last segment contains a non-leading `:` followed by
+/// a tail matching `[A-Za-z][A-Za-z0-9]*`. Any other `:tail` (invalid
+/// characters, empty, multiple `:` in one segment) is left as part of the path
+/// and the returned action is `null` — incoming URLs that happen to contain
+/// `:` in non-AIP forms keep matching whatever literal/param routes they did
+/// before.
+pub fn extractAction(path: []const u8) ActionSplit {
+    var trimmed = path;
+    if (trimmed.len > 0 and trimmed[trimmed.len - 1] == '/') {
+        trimmed = trimmed[0 .. trimmed.len - 1];
+    }
+    const last_slash = std.mem.lastIndexOfScalar(u8, trimmed, '/');
+    const last_seg_start: usize = if (last_slash) |pos| pos + 1 else 0;
+    if (last_seg_start >= trimmed.len) return .{ .path = path, .action = null };
+    const last_seg = trimmed[last_seg_start..];
+    var i: usize = 1;
+    while (i < last_seg.len) : (i += 1) {
+        if (last_seg[i] == ':') {
+            const tail = last_seg[i + 1 ..];
+            if (!isValidActionName(tail)) return .{ .path = path, .action = null };
+            return .{ .path = trimmed[0 .. last_seg_start + i], .action = tail };
+        }
+    }
+    return .{ .path = path, .action = null };
+}
+
+/// Comptime: split a Route Pattern into its path-pattern and optional Action.
+///
+/// Compile-errors on invalid Action names and on Actions attached to a
+/// catch-all segment (`*name:action` is disallowed because catch-alls
+/// swallow everything by design).
+pub fn parsePatternAction(comptime pattern: []const u8) ActionSplit {
+    comptime {
+        const last_slash = std.mem.lastIndexOfScalar(u8, pattern, '/');
+        const last_seg_start: usize = if (last_slash) |pos| pos + 1 else 0;
+        if (last_seg_start >= pattern.len) return .{ .path = pattern, .action = null };
+        const last_seg = pattern[last_seg_start..];
+
+        if (last_seg[0] == '*') {
+            for (last_seg) |c| {
+                if (c == ':') {
+                    @compileError("action not allowed on catch-all segment in pattern '" ++ pattern ++ "'");
+                }
+            }
+            return .{ .path = pattern, .action = null };
+        }
+
+        var i: usize = 1;
+        while (i < last_seg.len) : (i += 1) {
+            if (last_seg[i] == ':') {
+                const tail = last_seg[i + 1 ..];
+                if (!isValidActionName(tail)) {
+                    @compileError("invalid action name '" ++ tail ++ "' in pattern '" ++ pattern ++ "' (must match [A-Za-z][A-Za-z0-9]*)");
+                }
+                return .{ .path = pattern[0 .. last_seg_start + i], .action = tail };
+            }
+        }
+        return .{ .path = pattern, .action = null };
+    }
+}
+
+fn isValidActionName(s: []const u8) bool {
+    if (s.len == 0) return false;
+    if (!std.ascii.isAlphabetic(s[0])) return false;
+    for (s[1..]) |c| {
+        if (!std.ascii.isAlphanumeric(c)) return false;
+    }
+    return true;
+}
+
+fn actionEql(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return std.mem.eql(u8, a.?, b.?);
 }
 
 /// Extract the path component from a URI, stripping query string and fragment.
@@ -560,4 +661,328 @@ test "Router: ws_handler is set on response" {
     const resp = dispatch(std.testing.allocator, test_io, &req);
     try testing.expectEqual(Response.StatusCode.switching_protocols, resp.status);
     try testing.expect(resp.ws_handler != null);
+}
+
+// --- AIP-136 Action tests ---
+
+test "Router: extractAction valid action" {
+    const r = extractAction("/users/123:archive");
+    try testing.expectEqualStrings("/users/123", r.path);
+    try testing.expectEqualStrings("archive", r.action.?);
+}
+
+test "Router: extractAction collection-level action" {
+    const r = extractAction("/users:batchGet");
+    try testing.expectEqualStrings("/users", r.path);
+    try testing.expectEqualStrings("batchGet", r.action.?);
+}
+
+test "Router: extractAction trailing slash" {
+    const r = extractAction("/users/123:archive/");
+    try testing.expectEqualStrings("/users/123", r.path);
+    try testing.expectEqualStrings("archive", r.action.?);
+}
+
+test "Router: extractAction no colon" {
+    const r = extractAction("/users/123");
+    try testing.expectEqualStrings("/users/123", r.path);
+    try testing.expect(r.action == null);
+}
+
+test "Router: extractAction invalid character class falls back to literal" {
+    const r = extractAction("/users/123:foo-bar");
+    try testing.expectEqualStrings("/users/123:foo-bar", r.path);
+    try testing.expect(r.action == null);
+}
+
+test "Router: extractAction multiple colons in last segment" {
+    // First non-leading `:` splits; tail `bar:baz` is invalid → no action.
+    const r = extractAction("/users/foo:bar:baz");
+    try testing.expectEqualStrings("/users/foo:bar:baz", r.path);
+    try testing.expect(r.action == null);
+}
+
+test "Router: extractAction empty tail" {
+    const r = extractAction("/users/123:");
+    try testing.expectEqualStrings("/users/123:", r.path);
+    try testing.expect(r.action == null);
+}
+
+test "Router: extractAction leading colon in segment is not an action" {
+    // `:foo` is the segment — leading `:` is the path-param sigil, not Action.
+    const r = extractAction("/:foo");
+    try testing.expectEqualStrings("/:foo", r.path);
+    try testing.expect(r.action == null);
+}
+
+test "Router: extractAction colon in non-last segment is literal" {
+    const r = extractAction("/users/foo:archive/extra");
+    try testing.expectEqualStrings("/users/foo:archive/extra", r.path);
+    try testing.expect(r.action == null);
+}
+
+test "Router: parsePatternAction extracts action from pattern" {
+    const r = comptime parsePatternAction("/users/:id:archive");
+    try testing.expectEqualStrings("/users/:id", r.path);
+    try testing.expectEqualStrings("archive", r.action.?);
+}
+
+test "Router: parsePatternAction no action returns original" {
+    const r = comptime parsePatternAction("/users/:id");
+    try testing.expectEqualStrings("/users/:id", r.path);
+    try testing.expect(r.action == null);
+}
+
+test "Router: dispatch matches action route" {
+    const routes = [_]Route{
+        .{ .method = .POST, .path = "/users/:id:archive", .handler = struct {
+            fn h(_: std.mem.Allocator, _: std.Io, request: *const Request) Response {
+                return Response.init(.ok, "text/plain", request.params.get("id") orelse "");
+            }
+        }.h },
+    };
+
+    const dispatch = handler(&routes);
+    const test_io: std.Io = .{ .userdata = null, .vtable = undefined };
+
+    const req = try Request.parseConst("POST /users/42:archive HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
+    const resp = dispatch(std.testing.allocator, test_io, &req);
+    try testing.expectEqual(Response.StatusCode.ok, resp.status);
+    try testing.expectEqualStrings("42", resp.body);
+}
+
+test "Router: dispatch action route does not match URL without action" {
+    const routes = [_]Route{
+        .{ .method = .POST, .path = "/users/:id:archive", .handler = struct {
+            fn h(_: std.mem.Allocator, _: std.Io, _: *const Request) Response {
+                return Response.init(.ok, "text/plain", "matched");
+            }
+        }.h },
+    };
+
+    const dispatch = handler(&routes);
+    const test_io: std.Io = .{ .userdata = null, .vtable = undefined };
+
+    const req = try Request.parseConst("POST /users/42 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
+    const resp = dispatch(std.testing.allocator, test_io, &req);
+    try testing.expectEqual(Response.StatusCode.not_found, resp.status);
+}
+
+test "Router: dispatch plain route does not match URL with action" {
+    const routes = [_]Route{
+        .{ .method = .POST, .path = "/users/:id", .handler = struct {
+            fn h(_: std.mem.Allocator, _: std.Io, _: *const Request) Response {
+                return Response.init(.ok, "text/plain", "matched");
+            }
+        }.h },
+    };
+
+    const dispatch = handler(&routes);
+    const test_io: std.Io = .{ .userdata = null, .vtable = undefined };
+
+    const req = try Request.parseConst("POST /users/42:archive HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
+    const resp = dispatch(std.testing.allocator, test_io, &req);
+    try testing.expectEqual(Response.StatusCode.not_found, resp.status);
+}
+
+test "Router: dispatch picks the right action among several" {
+    const routes = [_]Route{
+        .{ .method = .POST, .path = "/users/:id:archive", .handler = struct {
+            fn h(_: std.mem.Allocator, _: std.Io, _: *const Request) Response {
+                return Response.init(.ok, "text/plain", "archived");
+            }
+        }.h },
+        .{ .method = .POST, .path = "/users/:id:unarchive", .handler = struct {
+            fn h(_: std.mem.Allocator, _: std.Io, _: *const Request) Response {
+                return Response.init(.ok, "text/plain", "unarchived");
+            }
+        }.h },
+        .{ .method = .POST, .path = "/users/:id:transfer", .handler = struct {
+            fn h(_: std.mem.Allocator, _: std.Io, _: *const Request) Response {
+                return Response.init(.ok, "text/plain", "transferred");
+            }
+        }.h },
+    };
+
+    const dispatch = handler(&routes);
+    const test_io: std.Io = .{ .userdata = null, .vtable = undefined };
+
+    const r1 = try Request.parseConst("POST /users/1:archive HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
+    try testing.expectEqualStrings("archived", dispatch(std.testing.allocator, test_io, &r1).body);
+
+    const r2 = try Request.parseConst("POST /users/1:unarchive HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
+    try testing.expectEqualStrings("unarchived", dispatch(std.testing.allocator, test_io, &r2).body);
+
+    const r3 = try Request.parseConst("POST /users/1:transfer HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
+    try testing.expectEqualStrings("transferred", dispatch(std.testing.allocator, test_io, &r3).body);
+
+    const r4 = try Request.parseConst("POST /users/1:unknown HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
+    try testing.expectEqual(Response.StatusCode.not_found, dispatch(std.testing.allocator, test_io, &r4).status);
+}
+
+test "Router: dispatch sets request.action for matched route" {
+    const routes = [_]Route{
+        .{ .method = .POST, .path = "/users/:id:archive", .handler = struct {
+            fn h(_: std.mem.Allocator, _: std.Io, request: *const Request) Response {
+                return Response.init(.ok, "text/plain", request.action orelse "<none>");
+            }
+        }.h },
+    };
+
+    const dispatch = handler(&routes);
+    const test_io: std.Io = .{ .userdata = null, .vtable = undefined };
+
+    const req = try Request.parseConst("POST /users/42:archive HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
+    const resp = dispatch(std.testing.allocator, test_io, &req);
+    try testing.expectEqualStrings("archive", resp.body);
+}
+
+test "Router: dispatch sets request.action on 404 fall-through" {
+    const routes = [_]Route{
+        .{ .method = .GET, .path = "/", .handler = struct {
+            fn h(_: std.mem.Allocator, _: std.Io, _: *const Request) Response {
+                return Response.init(.ok, "text/plain", "home");
+            }
+        }.h },
+    };
+
+    const custom_404 = struct {
+        fn h(_: std.mem.Allocator, _: std.Io, request: *const Request) Response {
+            return Response.init(.not_found, "text/plain", request.action orelse "<none>");
+        }
+    }.h;
+
+    const dispatch = handlerWithFallback(&routes, custom_404);
+    const test_io: std.Io = .{ .userdata = null, .vtable = undefined };
+
+    const req = try Request.parseConst("POST /users/42:archive HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
+    const resp = dispatch(std.testing.allocator, test_io, &req);
+    try testing.expectEqual(Response.StatusCode.not_found, resp.status);
+    try testing.expectEqualStrings("archive", resp.body);
+}
+
+test "Router: dispatch leaves request.action null when URL has no action" {
+    const routes = [_]Route{
+        .{ .method = .GET, .path = "/users/:id", .handler = struct {
+            fn h(_: std.mem.Allocator, _: std.Io, request: *const Request) Response {
+                return Response.init(.ok, "text/plain", if (request.action == null) "null" else "set");
+            }
+        }.h },
+    };
+
+    const dispatch = handler(&routes);
+    const test_io: std.Io = .{ .userdata = null, .vtable = undefined };
+
+    const req = try Request.parseConst("GET /users/42 HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    try testing.expectEqualStrings("null", dispatch(std.testing.allocator, test_io, &req).body);
+}
+
+test "Router: invalid action in URL falls back to literal param capture" {
+    // `:foo-bar` is not a valid action — it stays as part of the param value.
+    const routes = [_]Route{
+        .{ .method = .GET, .path = "/items/:sku", .handler = struct {
+            fn h(_: std.mem.Allocator, _: std.Io, request: *const Request) Response {
+                return Response.init(.ok, "text/plain", request.params.get("sku") orelse "");
+            }
+        }.h },
+    };
+
+    const dispatch = handler(&routes);
+    const test_io: std.Io = .{ .userdata = null, .vtable = undefined };
+
+    const req = try Request.parseConst("GET /items/SKU-123:foo-bar HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    const resp = dispatch(std.testing.allocator, test_io, &req);
+    try testing.expectEqualStrings("SKU-123:foo-bar", resp.body);
+}
+
+test "Router: collection-level action route" {
+    const routes = [_]Route{
+        .{ .method = .POST, .path = "/users:batchGet", .handler = struct {
+            fn h(_: std.mem.Allocator, _: std.Io, _: *const Request) Response {
+                return Response.init(.ok, "text/plain", "batched");
+            }
+        }.h },
+    };
+
+    const dispatch = handler(&routes);
+    const test_io: std.Io = .{ .userdata = null, .vtable = undefined };
+
+    const req = try Request.parseConst("POST /users:batchGet HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
+    const resp = dispatch(std.testing.allocator, test_io, &req);
+    try testing.expectEqualStrings("batched", resp.body);
+}
+
+test "Router: action route coexists with plain route on same path" {
+    const routes = [_]Route{
+        .{ .method = .POST, .path = "/users/:id:archive", .handler = struct {
+            fn h(_: std.mem.Allocator, _: std.Io, _: *const Request) Response {
+                return Response.init(.ok, "text/plain", "archived");
+            }
+        }.h },
+        .{ .method = .GET, .path = "/users/:id", .handler = struct {
+            fn h(_: std.mem.Allocator, _: std.Io, _: *const Request) Response {
+                return Response.init(.ok, "text/plain", "got");
+            }
+        }.h },
+    };
+
+    const dispatch = handler(&routes);
+    const test_io: std.Io = .{ .userdata = null, .vtable = undefined };
+
+    const r1 = try Request.parseConst("GET /users/42 HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    try testing.expectEqualStrings("got", dispatch(std.testing.allocator, test_io, &r1).body);
+
+    const r2 = try Request.parseConst("POST /users/42:archive HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
+    try testing.expectEqualStrings("archived", dispatch(std.testing.allocator, test_io, &r2).body);
+}
+
+test "Router: action route with query string" {
+    const routes = [_]Route{
+        .{ .method = .POST, .path = "/users/:id:archive", .handler = struct {
+            fn h(_: std.mem.Allocator, _: std.Io, request: *const Request) Response {
+                return Response.init(.ok, "text/plain", request.params.get("id") orelse "");
+            }
+        }.h },
+    };
+
+    const dispatch = handler(&routes);
+    const test_io: std.Io = .{ .userdata = null, .vtable = undefined };
+
+    const req = try Request.parseConst("POST /users/42:archive?reason=spam HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
+    const resp = dispatch(std.testing.allocator, test_io, &req);
+    try testing.expectEqualStrings("42", resp.body);
+}
+
+test "Router: action route with trailing slash" {
+    const routes = [_]Route{
+        .{ .method = .POST, .path = "/users/:id:archive", .handler = struct {
+            fn h(_: std.mem.Allocator, _: std.Io, _: *const Request) Response {
+                return Response.init(.ok, "text/plain", "ok");
+            }
+        }.h },
+    };
+
+    const dispatch = handler(&routes);
+    const test_io: std.Io = .{ .userdata = null, .vtable = undefined };
+
+    const req = try Request.parseConst("POST /users/42:archive/ HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
+    const resp = dispatch(std.testing.allocator, test_io, &req);
+    try testing.expectEqual(Response.StatusCode.ok, resp.status);
+}
+
+test "Router: action route rejects non-POST GET request at runtime" {
+    const routes = [_]Route{
+        .{ .method = .POST, .path = "/users/:id:archive", .handler = struct {
+            fn h(_: std.mem.Allocator, _: std.Io, _: *const Request) Response {
+                return Response.init(.ok, "text/plain", "ok");
+            }
+        }.h },
+    };
+
+    const dispatch = handler(&routes);
+    const test_io: std.Io = .{ .userdata = null, .vtable = undefined };
+
+    const req = try Request.parseConst("GET /users/42:archive HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    const resp = dispatch(std.testing.allocator, test_io, &req);
+    try testing.expectEqual(Response.StatusCode.not_found, resp.status);
 }

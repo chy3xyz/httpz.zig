@@ -74,6 +74,10 @@ body: []const u8 = "",
 raw: []const u8 = "",
 /// Path parameters extracted from route matching.
 params: Params = .{},
+/// AIP-136 custom-method action parsed from the URL's trailing `:verb`.
+/// Set whenever the URL contains a syntactically valid action
+/// (`[A-Za-z][A-Za-z0-9]*`), independent of whether routing matched.
+action: ?[]const u8 = null,
 /// Type-keyed context for middleware to pass state to handlers.
 context: Context = .{},
 

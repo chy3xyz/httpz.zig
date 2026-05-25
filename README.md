@@ -7,7 +7,7 @@ An HTTP/1.1 and HTTP/2 library for Zig 0.16, built on the `std.Io` async model.
 - **HTTP Server** — HTTP/1.1 and HTTP/2, keep-alive, chunked transfer encoding, connection limits, slowloris protection
 - **HTTP Client** — HTTP/1.1 and HTTP/2, configurable timeouts, response size limits
 - **HTTP/2** — ALPN negotiation, h2c (cleartext), HPACK compression, stream multiplexing, flow control, server push, trailers
-- **Router** — path parameters (`:id`), comptime dispatch, custom 404 handlers
+- **Router** — path parameters (`:id`), catch-all segments (`*rest`), AIP-136 custom methods (`:archive`), comptime dispatch, custom 404 handlers
 - **WebSocket** — RFC 6455 upgrade, text/binary frames, fragmentation reassembly, per-route handlers
 - **Streaming Responses** — chunked encoding, Server-Sent Events, zero-copy file serving
 - **Middleware** — CORS and gzip compression via composable `wrap` functions
@@ -95,6 +95,39 @@ fn handleHello(_: std.mem.Allocator, _: std.Io, request: *const httpz.Request) h
 `GET /hello/alice` matches the `:name` parameter — retrieve it with `request.params.get("name")`.
 
 Use `Router.handlerWithFallback` to provide a custom 404 handler instead of the default.
+
+### Custom Methods (AIP-136)
+
+For actions that don't fit cleanly into the standard HTTP verbs — archiving a user, cancelling an order, translating a message — the Router supports [Google AIP-136](https://google.aip.dev/136) custom methods. Append `:verb` to the last segment of the path; the verb becomes a third routing axis alongside method and path:
+
+```zig
+comptime httpz.Router.handler(&.{
+    .{ .method = .GET,  .path = "/users/:id",          .handler = getUser },
+    .{ .method = .POST, .path = "/users/:id:archive",  .handler = archiveUser },
+    .{ .method = .POST, .path = "/users/:id:transfer", .handler = transferUser },
+    .{ .method = .POST, .path = "/users:batchGet",     .handler = batchGetUsers },
+});
+```
+
+- `GET /users/42` → `getUser`
+- `POST /users/42:archive` → `archiveUser` (`request.params.get("id")` is `"42"`)
+- `POST /users:batchGet` → `batchGetUsers` (collection-level action)
+
+The parsed action is exposed on `request.action: ?[]const u8` — useful for logging, or for a fall-through 404 handler that reports the unknown verb:
+
+```zig
+fn archiveUser(_: std.mem.Allocator, _: std.Io, request: *const httpz.Request) httpz.Response {
+    std.debug.print("action={s} id={s}\n", .{ request.action.?, request.params.get("id").? });
+    return httpz.Response.init(.ok, "text/plain", "archived");
+}
+```
+
+#### Rules
+
+- **Exact match.** A route with action `archive` does not match a URL without one, and vice versa. `POST /users/:id` and `POST /users/:id:archive` are distinct routes that can coexist.
+- **POST only.** AIP-136 requires custom methods to be invoked via POST. Declaring an action with any method other than `.POST` is a comptime error.
+- **Action name format.** Must match `[A-Za-z][A-Za-z0-9]*` (AIP `camelCase`: `archive`, `batchGet`, `listMessages`). Invalid names in patterns are a comptime error; invalid names in incoming URLs are treated as literal path content (so `/items/SKU-123:foo-bar` still matches `/items/:sku` with `sku = "SKU-123:foo-bar"`).
+- **Not on catch-all segments.** `/foo/*rest:action` is a comptime error — catch-alls swallow everything by design.
 
 ## Middleware
 
