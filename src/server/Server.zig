@@ -5,6 +5,7 @@ const tls = @import("../openssl.zig");
 const Request = @import("../Request.zig");
 const Response = @import("../Response.zig");
 const Connection = @import("Connection.zig");
+const ChunkedWriter = @import("ChunkedWriter.zig");
 const Headers = @import("../Headers.zig");
 const Date = @import("Date.zig");
 const Proxy = @import("Proxy.zig");
@@ -418,11 +419,20 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
             writer.writeAll(header_data) catch return;
             writer.flush() catch return;
 
-            // Call stream function with the network writer
-            stream_fn(response.stream_context, writer);
-
-            // Final flush
-            writer.flush() catch return;
+            // Hand stream_fn a writer that produces correctly-framed
+            // bytes. When the response advertises `Transfer-Encoding:
+            // chunked`, the wrapper turns every drain into a chunk
+            // (RFC 7230 §4.1) and we emit the terminating `0\r\n\r\n`
+            // marker afterwards. Without the wrapper, the raw bytes
+            // would go out unframed but the header would lie about it.
+            if (response.chunked) {
+                var chunked = ChunkedWriter.init(writer);
+                stream_fn(response.stream_context, &chunked.interface);
+                chunked.finish() catch {};
+            } else {
+                stream_fn(response.stream_context, writer);
+                writer.flush() catch return;
+            }
             response.deinit(request_allocator);
             // Streaming responses don't keep-alive (simplicity)
             return;
