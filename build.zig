@@ -22,6 +22,7 @@ pub fn build(b: *std.Build) void {
         "server_websocket",
         "server_router",
         "server_streaming",
+        "server_repro",
     };
 
     inline for (examples) |name| {

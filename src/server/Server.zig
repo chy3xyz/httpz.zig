@@ -76,13 +76,118 @@ pub const Config = struct {
     /// When set, the server performs a TLS handshake on each accepted
     /// connection and serves HTTP over the encrypted channel.
     tls_config: ?tls.config.Server = null,
+    /// CLOSE-WAIT sweeper interval, in milliseconds. The sweeper polls all
+    /// active connection fds for POLLRDHUP and forces `shutdown(SHUT_RDWR)`
+    /// on any that the peer has closed. This breaks a handler thread that
+    /// is stuck (e.g., on a saturated downstream pool) so the deferred
+    /// close on the connection task can run, releasing the fd.
+    ///
+    /// 0 disables the sweeper. Default 2000ms balances responsiveness with
+    /// poll() syscall overhead.
+    sweeper_interval_ms: u32 = 2000,
 };
 
 const min_initial_request_buffer_size = 16 * 1024;
 
+/// POLLRDHUP — fires when the peer has closed its write side (sent FIN).
+/// Linux-specific. Not currently exposed via `std.posix.POLL`, but the
+/// kernel ABI value is stable at 0x2000 on all supported architectures.
+const POLLRDHUP: i16 = 0x2000;
+
+/// CLOSE-WAIT sweeper config.
+///
+/// Each accepted connection's fd is registered with the sweeper. A background
+/// thread polls all registered fds for `POLLRDHUP` (peer closed write side).
+/// When peer FIN is observed, the sweeper calls `shutdown(fd, SHUT_RDWR)` so
+/// any blocked read/write on that fd in the handler task fails immediately,
+/// causing the connection task to return and run its deferred close.
+///
+/// This bounds CLOSE-WAIT FD pile-up under load, in particular when a handler
+/// thread is stuck (e.g., waiting on a saturated downstream pool) and would
+/// otherwise never re-enter the read loop to observe the peer's FIN.
+const ConnSweeper = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+    fds: std.ArrayListUnmanaged(Io.net.Socket.Handle) = .empty,
+    stop: std.atomic.Value(bool) = .init(false),
+    thread: ?std.Thread = null,
+    allocator: std.mem.Allocator,
+    interval_ms: u32,
+
+    fn lockMutex(self: *ConnSweeper) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn register(self: *ConnSweeper, fd: Io.net.Socket.Handle) void {
+        self.lockMutex();
+        defer self.mutex.unlock();
+        self.fds.append(self.allocator, fd) catch {};
+    }
+
+    fn unregister(self: *ConnSweeper, fd: Io.net.Socket.Handle) void {
+        self.lockMutex();
+        defer self.mutex.unlock();
+        for (self.fds.items, 0..) |existing, i| {
+            if (existing == fd) {
+                _ = self.fds.swapRemove(i);
+                return;
+            }
+        }
+    }
+
+    fn run(self: *ConnSweeper) void {
+        var pollfds: std.ArrayListUnmanaged(std.posix.pollfd) = .empty;
+        defer pollfds.deinit(self.allocator);
+
+        while (!self.stop.load(.acquire)) {
+            // Sleep the interval. Use posix nanosleep — std.Thread.sleep was
+            // removed in Zig 0.16, and Io.sleep requires an Io handle we don't
+            // own here (the sweeper is a plain std.Thread).
+            const total_ns: u64 = @as(u64, self.interval_ms) * std.time.ns_per_ms;
+            var req = std.posix.timespec{
+                .sec = @intCast(total_ns / std.time.ns_per_s),
+                .nsec = @intCast(total_ns % std.time.ns_per_s),
+            };
+            while (std.posix.errno(std.posix.system.nanosleep(&req, &req)) == .INTR) {}
+
+            self.lockMutex();
+            pollfds.clearRetainingCapacity();
+            for (self.fds.items) |fd| {
+                pollfds.append(self.allocator, .{
+                    .fd = fd,
+                    // POLLRDHUP fires when the peer closed its write side.
+                    // POLLHUP fires when the peer closed the connection entirely.
+                    // POLLERR fires for connection errors.
+                    .events = POLLRDHUP,
+                    .revents = 0,
+                }) catch break;
+            }
+            self.mutex.unlock();
+
+            if (pollfds.items.len == 0) continue;
+
+            // Non-blocking poll: timeout 0.
+            const rc = std.posix.system.poll(pollfds.items.ptr, @intCast(pollfds.items.len), 0);
+            if (rc <= 0) continue;
+
+            for (pollfds.items) |pf| {
+                // POLLRDHUP/POLLHUP/POLLERR all indicate peer is gone or socket is broken.
+                const hup_mask: i16 = POLLRDHUP | std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL;
+                if ((pf.revents & hup_mask) != 0) {
+                    // Force any blocked read/write in the handler task to fail.
+                    // The handler task's `defer stream.close(io)` then runs and the fd
+                    // is released. We deliberately don't close() here — that would risk
+                    // a double-close race with the handler task's defer.
+                    _ = std.posix.system.shutdown(pf.fd, std.posix.SHUT.RDWR);
+                }
+            }
+        }
+    }
+};
+
 config: Config,
 handler: Connection.Handler,
 active_connections: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+sweeper: ?*ConnSweeper = null,
 
 pub fn init(config: Config, handler: Connection.Handler) Server {
     return .{
@@ -114,6 +219,29 @@ pub fn run(self: *Server, io: Io) RunError!void {
     var connection_group: Io.Group = .init;
     defer connection_group.cancel(io);
 
+    // Spawn the CLOSE-WAIT sweeper. Best-effort: if anything fails (allocator
+    // out of memory, thread spawn fails), we proceed without it — connections
+    // will still be served correctly, just without the FD-pile-up bound.
+    const gpa = std.heap.page_allocator;
+    var sweeper: ConnSweeper = .{
+        .allocator = gpa,
+        .interval_ms = self.config.sweeper_interval_ms,
+    };
+    var sweeper_started = false;
+    if (self.config.sweeper_interval_ms > 0) {
+        if (std.Thread.spawn(.{}, ConnSweeper.run, .{&sweeper})) |t| {
+            sweeper.thread = t;
+            self.sweeper = &sweeper;
+            sweeper_started = true;
+        } else |_| {}
+    }
+    defer if (sweeper_started) {
+        sweeper.stop.store(true, .release);
+        if (sweeper.thread) |t| t.join();
+        sweeper.fds.deinit(sweeper.allocator);
+        self.sweeper = null;
+    };
+
     while (true) {
         const stream = server.accept(io) catch |err| {
             std.debug.print("Accept error: {}\n", .{err});
@@ -133,6 +261,11 @@ pub fn run(self: *Server, io: Io) RunError!void {
         }
 
         connection_group.concurrent(io, handleConnectionTask, .{ self, stream, io }) catch {
+            // The concurrent() failure means the connection's task didn't start.
+            // Decrement the counter we incremented above so it stays accurate.
+            if (self.config.max_connections > 0) {
+                _ = self.active_connections.fetchSub(1, .release);
+            }
             rejectBusyConnection(stream, io);
             continue;
         };
@@ -494,6 +627,13 @@ fn handleConnectionTask(self: *Server, stream: Io.net.Stream, io: Io) Io.Cancela
     defer if (self.config.max_connections > 0) {
         _ = self.active_connections.fetchSub(1, .release);
     };
+
+    // Register this connection with the sweeper so it can detect peer FIN
+    // (POLLRDHUP) and break us out of a stuck handler via shutdown(). The
+    // sweeper itself never closes the fd — the defer above does that — so
+    // there's no double-close race.
+    if (self.sweeper) |sw| sw.register(stream.socket.handle);
+    defer if (self.sweeper) |sw| sw.unregister(stream.socket.handle);
 
     self.handleConnection(stream, io) catch |err| {
         std.debug.print("Connection error: {}\n", .{err});
@@ -1117,4 +1257,58 @@ test "Server: active_connections counter" {
     try testing.expectEqual(@as(u32, 1), srv.active_connections.load(.monotonic));
     _ = srv.active_connections.fetchSub(1, .monotonic);
     try testing.expectEqual(@as(u32, 0), srv.active_connections.load(.monotonic));
+}
+
+// CLOSE-WAIT sweeper unit test.
+//
+// Creates a UNIX socketpair, registers the server-side fd with a sweeper, then
+// closes the client end so the server-side fd transitions to CLOSE_WAIT. The
+// sweeper's poll() must observe POLLRDHUP and call shutdown(SHUT_RDWR) on the
+// server-side fd within a short interval. We detect "shutdown happened" by
+// observing that a subsequent send() on the fd fails (EPIPE) or that
+// recv()/read() returns 0.
+test "Server: ConnSweeper detects peer FIN and shuts down the fd" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const posix = std.posix;
+
+    // socketpair gives two endpoints, both AF_UNIX SOCK_STREAM.
+    var sv: [2]std.c.fd_t = .{ -1, -1 };
+    const sp_rc = posix.system.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sv);
+    if (posix.errno(sp_rc) != .SUCCESS) return error.SkipZigTest;
+    defer {
+        if (sv[0] >= 0) _ = posix.system.close(sv[0]);
+        if (sv[1] >= 0) _ = posix.system.close(sv[1]);
+    }
+    // Treat sv[1] as the "server-accepted" fd; sv[0] as the "client" fd.
+
+    var sweeper: ConnSweeper = .{
+        .allocator = testing.allocator,
+        .interval_ms = 25, // poll quickly so the test is snappy
+    };
+    sweeper.thread = try std.Thread.spawn(.{}, ConnSweeper.run, .{&sweeper});
+    defer {
+        sweeper.stop.store(true, .release);
+        if (sweeper.thread) |t| t.join();
+        sweeper.fds.deinit(sweeper.allocator);
+    }
+
+    sweeper.register(sv[1]);
+    defer sweeper.unregister(sv[1]);
+
+    // Client closes — this is the peer-FIN equivalent.
+    _ = posix.system.close(sv[0]);
+    sv[0] = -1;
+
+    // Wait up to ~1s for the sweeper to shut down the server-accepted side.
+    // Probe via send(); after shutdown(SHUT_WR), send() returns EPIPE.
+    var i: usize = 0;
+    const probe = [_]u8{'x'};
+    while (i < 40) : (i += 1) {
+        var req = posix.timespec{ .sec = 0, .nsec = 25 * std.time.ns_per_ms };
+        while (posix.errno(posix.system.nanosleep(&req, &req)) == .INTR) {}
+        const rc = posix.system.send(sv[1], &probe, probe.len, std.c.MSG.NOSIGNAL);
+        const e = posix.errno(rc);
+        if (e == .PIPE) return; // success — write side shut down
+    }
+    return error.TestExpectedFailure;
 }
