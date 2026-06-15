@@ -205,3 +205,49 @@ src/
 - **Multiplexing changes the concurrency model** — HTTP/1.1 is one-request-per-connection; HTTP/2 needs concurrent stream handling within a single connection
 - **Priority signaling is deprecated** — Implement PRIORITY frame parsing for interop but don't invest in complex scheduling (§5.3.2)
 - **Server Push is falling out of favor** — Chrome removed support; Phase 9 is truly optional
+
+---
+
+# HTTP/3 Development Record (RFC 9114)
+
+> **Status: Phase 1 Complete** — QUIC transport + H3 session layer implemented. Request/response dispatch pending.
+
+## Approach
+
+Bound to ngtcp2 (QUIC) and nghttp3 (HTTP/3) via translate-C, same pattern as OpenSSL. Reuses existing httpz Request/Response/Handler types.
+
+## Dependencies
+- `libngtcp2` ≥ 1.23 — QUIC transport
+- `libnghttp3` ≥ 1.16 — HTTP/3 framing + QPACK
+- `openssl@3` — TLS 1.3 (QUIC crypto)
+
+## Implemented
+
+- [x] **Build Integration** — translate-C headers + linkSystemLibrary for ngtcp2/nghttp3
+- [x] **QUIC Layer** (`src/h3/quic.zig`) — Connection, Listener, connect(), packet I/O, timer expiry, CID routing
+- [x] **H3 Session** (`src/h3/http3.zig`) — nghttp3 connection lifecycle, error types
+- [x] **Client Stub** (`src/h3/Client.zig`) — QUIC connect + H3 session init
+- [x] **Server Stub** (`src/h3/Server.zig`) — UDP listener + CID routing table
+- [x] **Module Exports** — `httpz.h3.quic`, `httpz.h3.http3`, `httpz.h3.Client`, `httpz.h3.Server`
+
+## Remaining
+
+- [ ] **Client request/response** — nghttp3 submit_request + recv_data callbacks → httpz.Response
+- [ ] **Server dispatch** — CID routing + accept loop + nghttp3 recv_header → httpz.Request → handler
+- [ ] **QPACK integration** — nghttp3 encoder/decoder stream binding
+- [ ] **0-RTT** — early data support
+- [ ] **Connection migration** — path validation
+- [ ] **QLog / debugging** — ngtcp2 QLog integration for Wireshark
+
+## File Structure
+
+```
+src/h3/
+├── ngtcp2.h       → translate-C: ngtcp2 + crypto + ossl
+├── nghttp3.h      → translate-C: nghttp3
+├── quic.zig       → QUIC wrapper: UDP socket, ngtcp2_conn, callbacks, packet I/O
+├── http3.zig      → H3 session: nghttp3_conn, QPACK, request/response mapping (pending)
+├── Client.zig     → H3 client: connect + handshake + request cycle (stub)
+├── Server.zig     → H3 server: UDP listener + CID routing + accept (stub)
+└── root.zig       → Public exports
+```

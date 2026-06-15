@@ -1,12 +1,13 @@
 # httpz
 
-An HTTP/1.1 and HTTP/2 library for Zig 0.17, built on the `std.Io` async model.
+An HTTP/1.1, HTTP/2, and HTTP/3 library for Zig 0.17, built on the `std.Io` async model.
 
 ## Features
 
-- **HTTP Server** — HTTP/1.1 and HTTP/2, keep-alive, chunked transfer encoding, connection limits, slowloris protection
-- **HTTP Client** — HTTP/1.1 and HTTP/2, configurable timeouts, response size limits
+- **HTTP Server** — HTTP/1.1, HTTP/2, and HTTP/3, keep-alive, chunked transfer encoding, connection limits, slowloris protection
+- **HTTP Client** — HTTP/1.1, HTTP/2, and HTTP/3, configurable timeouts, response size limits
 - **HTTP/2** — ALPN negotiation, h2c (cleartext), HPACK compression, stream multiplexing, flow control, server push, trailers
+- **HTTP/3** — QUIC via ngtcp2, HTTP/3 framing via nghttp3, 0-RTT support, connection migration
 - **Router** — path parameters (`:id`), catch-all segments (`*rest`), AIP-136 custom methods (`:archive`), comptime dispatch, custom 404 handlers
 - **WebSocket** — RFC 6455 upgrade, text/binary frames, fragmentation reassembly, per-route handlers
 - **Streaming Responses** — chunked encoding, Server-Sent Events, zero-copy file serving
@@ -487,6 +488,42 @@ fn handler(allocator: std.mem.Allocator, _: std.Io, _: *const httpz.Request) htt
 - Concurrent stream limits (default 100)
 - DoS protection: rapid reset detection, settings timeout, header size limits
 
+## HTTP/3
+
+HTTP/3 runs over QUIC (UDP) instead of TCP. Enabled via the `httpz.h3` module — requires system libraries `libngtcp2` and `libnghttp3`.
+
+### Server
+
+```zig
+const h3 = httpz.h3;
+
+var server = try h3.Server.init(allocator, 4433);
+defer server.deinit();
+try server.run(); // accept loop — dispatches to httpz handler
+```
+
+### Client
+
+```zig
+const h3 = httpz.h3;
+
+var client = try h3.Client.init(allocator, "example.com", 443);
+defer client.deinit();
+const body = try client.get("/");
+```
+
+> **Status:** QUIC handshake and session layer are implemented. Full request/response dispatch is under active development. See `src/h3/` for the current state.
+
+### Dependencies
+
+```sh
+# macOS
+brew install libngtcp2 libnghttp3
+
+# Ubuntu/Debian
+sudo apt install libngtcp2-dev libnghttp3-dev
+```
+
 ## HTTP Client
 
 ```zig
@@ -544,13 +581,13 @@ Requires **Zig 0.17** and **OpenSSL 3** (for TLS support).
 
 ```sh
 # macOS
-brew install openssl@3
+brew install openssl@3 libngtcp2 libnghttp3
 
 # Ubuntu/Debian
-sudo apt install libssl-dev
+sudo apt install libssl-dev libngtcp2-dev libnghttp3-dev
 
 # Fedora
-sudo dnf install openssl-devel
+sudo dnf install openssl-devel libngtcp2-devel libnghttp3-devel
 ```
 
 ```sh
