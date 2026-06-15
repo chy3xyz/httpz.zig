@@ -56,7 +56,7 @@ pub fn flushPackets(conn: *Connection) Error!void {
         var dest: ngtcp2.ngtcp2_path = .{ .local = .{}, .remote = .{} };
         const n = ngtcp2.ngtcp2_conn_write_pkt_versioned(conn.conn, &dest, &pi, &conn.buf, conn.buf.len, nowNanos(), ngtcp2.NGTCP2_WRITE_PKT_FLAG_NONE);
         if (n < 0) {
-            if (n == @intCast(@intFromEnum(ngtcp2.NGTCP2_ERR_WOULDBLOCK))) return;
+            if (n == @intFromEnum(ngtcp2.NGTCP2_ERR_WOULDBLOCK)) return;
             return error.QuicError;
         }
         _ = posix.sendto(conn.socket, conn.buf[0..@intCast(n)], 0, @ptrCast(@alignCast(dest.remote.addr orelse return error.QuicError)), @intCast(dest.remote.addrlen)) catch return error.QuicError;
