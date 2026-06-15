@@ -2,22 +2,18 @@ const std = @import("std");
 const ngtcp2 = @import("ngtcp2_c");
 const posix = std.posix;
 
+const max_datagram_size = 65536;
+
 pub const Connection = struct {
     conn: *ngtcp2.ngtcp2_conn,
     socket: posix.fd_t,
-    allocator: std.mem.Allocator,
-    buf: [65536]u8 = undefined,
+    buf: [max_datagram_size]u8 = undefined,
 
     pub fn deinit(self: *Connection) void {
         ngtcp2.ngtcp2_conn_del(self.conn);
+        posix.close(self.socket);
+        self.* = undefined;
     }
-};
-
-pub const Error = error{
-    QuicError,
-    HandshakeFailed,
-    ConnectionClosed,
-    OutOfMemory,
 };
 
 /// Get nanoseconds until next QUIC timer fires, or null if idle.
@@ -28,7 +24,7 @@ pub fn getExpiry(conn: *Connection) ?u64 {
 }
 
 /// Handle QUIC timer expiry — call when getExpiry time elapses.
-pub fn handleExpiry(conn: *Connection) Error!void {
+pub fn handleExpiry(conn: *Connection) error{QuicError}!void {
     const ret = ngtcp2.ngtcp2_conn_handle_expiry(conn.conn, nowNanos());
     if (ret != 0) return error.QuicError;
     _ = try flushPackets(conn);
@@ -41,7 +37,7 @@ fn nowNanos() u64 {
 }
 
 /// Read a UDP packet and feed it to the QUIC connection.
-pub fn readPacket(conn: *Connection) Error!void {
+pub fn readPacket(conn: *Connection) error{QuicError}!void {
     const n = posix.recvfrom(conn.socket, &conn.buf, 0) catch |err| switch (err) {
         error.WouldBlock => return,
         else => return error.QuicError,
@@ -52,7 +48,7 @@ pub fn readPacket(conn: *Connection) Error!void {
 }
 
 /// Write any pending QUIC packets to the UDP socket.
-pub fn flushPackets(conn: *Connection) Error!void {
+pub fn flushPackets(conn: *Connection) error{QuicError}!void {
     while (true) {
         var pi: ngtcp2.ngtcp2_pkt_info = undefined;
         var dest: ngtcp2.ngtcp2_path = .{ .local = .{}, .remote = .{} };
@@ -61,6 +57,6 @@ pub fn flushPackets(conn: *Connection) Error!void {
             if (n == @intCast(@intFromEnum(ngtcp2.NGTCP2_ERR_WOULDBLOCK))) return;
             return error.QuicError;
         }
-        _ = posix.sendto(conn.socket, conn.buf[0..@intCast(n)], 0, posix.sockaddr{}, 0) catch return error.QuicError;
+        _ = posix.sendto(conn.socket, conn.buf[0..@intCast(n)], 0, @ptrCast(@alignCast(dest.remote.addr orelse return error.QuicError)), @intCast(dest.remote.addrlen)) catch return error.QuicError;
     }
 }
