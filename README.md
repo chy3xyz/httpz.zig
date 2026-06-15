@@ -1,6 +1,6 @@
 # httpz
 
-An HTTP/1.1 and HTTP/2 library for Zig 0.16, built on the `std.Io` async model.
+An HTTP/1.1 and HTTP/2 library for Zig 0.17, built on the `std.Io` async model.
 
 ## Features
 
@@ -55,7 +55,8 @@ zig fetch --save git+https://github.com/allain/httpz.zig
 Then in your `build.zig`:
 
 ```zig
-const httpz_mod = b.dependency("httpz", .{ .target = target }).module("httpz");
+const httpz_dep = b.dependency("httpz", .{ .target = target });
+const httpz_mod = httpz_dep.module("httpz");
 exe.root_module.addImport("httpz", httpz_mod);
 ```
 
@@ -539,7 +540,18 @@ httpz.Server.init(.{
 
 ## Building & Testing
 
-Requires Zig 0.16+.
+Requires **Zig 0.17** and **OpenSSL 3** (for TLS support).
+
+```sh
+# macOS
+brew install openssl@3
+
+# Ubuntu/Debian
+sudo apt install libssl-dev
+
+# Fedora
+sudo dnf install openssl-devel
+```
 
 ```sh
 # Run all tests (unit + integration)

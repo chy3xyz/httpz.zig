@@ -142,7 +142,7 @@ fn osSleep(ms: u32) void {
         .sec = @intCast(ms / 1000),
         .nsec = @intCast(@as(u64, ms % 1000) * 1_000_000),
     };
-    _ = std.os.linux.nanosleep(&ts, null);
+    _ = std.os.linux.nanosleep(@ptrCast(&ts), null);
 }
 
 /// Shared server state — start each server type exactly once.

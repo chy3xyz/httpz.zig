@@ -9,13 +9,7 @@ const Io = std.Io;
 const mem = std.mem;
 const posix = std.posix;
 
-pub const c = @cImport({
-    @cInclude("openssl/ssl.h");
-    @cInclude("openssl/err.h");
-    @cInclude("openssl/x509.h");
-    @cInclude("openssl/bio.h");
-    @cInclude("openssl/pem.h");
-});
+pub const c = @import("openssl_c");
 
 const Mutex = std.atomic.Mutex;
 

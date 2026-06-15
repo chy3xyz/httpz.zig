@@ -985,8 +985,9 @@ test "Request.Method: fromString parses all standard methods" {
 
 // /// RFC 2616 Section 5.1.1: Method.toBytes roundtrip
 test "Request.Method: toBytes roundtrip" {
-    inline for (@typeInfo(Method).@"enum".fields) |field| {
-        const m: Method = @enumFromInt(field.value);
+    const enum_info = @typeInfo(Method).@"enum";
+    inline for (enum_info.field_names, enum_info.field_values) |_, value| {
+        const m: Method = @enumFromInt(value);
         try testing.expectEqual(m, Method.fromString(m.toBytes()).?);
     }
 }

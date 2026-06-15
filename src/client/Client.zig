@@ -355,7 +355,7 @@ fn requestTls(self: *Client, conn: *tls.Connection, method: Request.Method, uri:
             } else {
                 // No content-length (might be chunked or connection-close) — check for chunked
                 if (findHeaderValue(header_data, "Transfer-Encoding")) |te| {
-                    if (std.ascii.indexOfIgnoreCase(te, "chunked") != null) {
+                    if (std.ascii.findIgnoreCasePos(te, 0, "chunked") != null) {
                         // For chunked, look for the terminating 0\r\n\r\n
                         if (std.mem.indexOf(u8, buf.items[header_end + 4 ..], "0\r\n\r\n") != null) break;
                         if (std.mem.indexOf(u8, buf.items[header_end + 4 ..], "\r\n0\r\n") != null) break;

@@ -4,10 +4,22 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Translate C headers for OpenSSL
+    const openssl_c = b.addTranslateC(.{
+        .root_source_file = b.path("src/openssl.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    openssl_c.addIncludePath(.{ .cwd_relative = "/opt/homebrew/opt/openssl@3/include" });
+    const openssl_c_mod = openssl_c.createModule();
+
     // Library module
     const httpz_mod = b.addModule("httpz", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
+        .imports = &.{
+            .{ .name = "openssl_c", .module = openssl_c_mod },
+        },
     });
     httpz_mod.linkSystemLibrary("ssl", .{});
     httpz_mod.linkSystemLibrary("crypto", .{});

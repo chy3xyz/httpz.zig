@@ -344,7 +344,7 @@ test "FrameReader: wrong frame during CONTINUATION is protocol error" {
     }).encode();
 
     // Send a PING instead of CONTINUATION
-    const ping_payload = [_]u8{0} ** 8;
+    const ping_payload: [8]u8 = @splat(0);
     const hdr2 = (FrameHeader{
         .length = 8,
         .frame_type = .ping,

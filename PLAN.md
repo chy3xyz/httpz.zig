@@ -1,11 +1,13 @@
-# HTTP/2 Development Plan for httpz (RFC 9113)
+# HTTP/2 Development Record for httpz (RFC 9113)
+
+> **Status: Complete** — All 10 phases implemented. This document is retained as a historical record of the implementation roadmap.
 
 ## Current State
 
 - Fully RFC 2616-compliant HTTP/1.1 server and client
 - TLS via OpenSSL (with ALPN support)
-- Binary framing, multiplexing, HPACK — all unimplemented
-- Branch `http2` exists but is clean (no work started)
+- Full RFC 9113 HTTP/2: binary framing, stream multiplexing, HPACK, flow control, settings negotiation, server push
+- All phases below were completed between Phase 0–9
 
 ---
 
