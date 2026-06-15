@@ -4,6 +4,8 @@ const posix = std.posix;
 
 const max_datagram_size = 65536;
 
+pub const Error = error{QuicError};
+
 pub const Connection = struct {
     conn: *ngtcp2.ngtcp2_conn,
     socket: posix.fd_t,
@@ -24,7 +26,7 @@ pub fn getExpiry(conn: *Connection) ?u64 {
 }
 
 /// Handle QUIC timer expiry — call when getExpiry time elapses.
-pub fn handleExpiry(conn: *Connection) error{QuicError}!void {
+pub fn handleExpiry(conn: *Connection) Error!void {
     const ret = ngtcp2.ngtcp2_conn_handle_expiry(conn.conn, nowNanos());
     if (ret != 0) return error.QuicError;
     _ = try flushPackets(conn);
@@ -37,7 +39,7 @@ fn nowNanos() u64 {
 }
 
 /// Read a UDP packet and feed it to the QUIC connection.
-pub fn readPacket(conn: *Connection) error{QuicError}!void {
+pub fn readPacket(conn: *Connection) Error!void {
     const n = posix.recvfrom(conn.socket, &conn.buf, 0) catch |err| switch (err) {
         error.WouldBlock => return,
         else => return error.QuicError,
@@ -48,7 +50,7 @@ pub fn readPacket(conn: *Connection) error{QuicError}!void {
 }
 
 /// Write any pending QUIC packets to the UDP socket.
-pub fn flushPackets(conn: *Connection) error{QuicError}!void {
+pub fn flushPackets(conn: *Connection) Error!void {
     while (true) {
         var pi: ngtcp2.ngtcp2_pkt_info = undefined;
         var dest: ngtcp2.ngtcp2_path = .{ .local = .{}, .remote = .{} };
