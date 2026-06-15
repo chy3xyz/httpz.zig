@@ -1,9 +1,6 @@
 const std = @import("std");
 const quic = @import("quic.zig");
 const http3 = @import("http3.zig");
-const ngtcp2 = @import("ngtcp2_c");
-const nghttp3 = @import("nghttp3_c");
-
 pub const Client = struct {
     quic_conn: quic.Connection,
     h3_session: http3.Session,

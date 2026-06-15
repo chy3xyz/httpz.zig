@@ -59,7 +59,7 @@ pub fn flushPackets(conn: *Connection) Error!void {
             if (n == @intFromEnum(ngtcp2.NGTCP2_ERR_WOULDBLOCK)) return;
             return error.QuicError;
         }
-        _ = posix.sendto(conn.socket, conn.buf[0..@intCast(n)], 0, @ptrCast(@alignCast(dest.remote.addr orelse return error.QuicError)), @intCast(dest.remote.addrlen)) catch return error.QuicError;
+        _ = posix.sendto(conn.socket, conn.buf[0..@intCast(n)], 0, dest.remote.addr orelse return error.QuicError, dest.remote.addrlen) catch return error.QuicError;
     }
 }
 
