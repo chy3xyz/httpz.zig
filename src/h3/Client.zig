@@ -13,7 +13,7 @@ pub const Client = struct {
         var qc = try quic.connect(host, port);
         errdefer qc.deinit();
 
-        var h3 = try http3.Session.init(allocator);
+        const h3 = try http3.Session.init(allocator);
 
         return .{
             .quic_conn = qc,
