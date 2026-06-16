@@ -497,9 +497,13 @@ HTTP/3 runs over QUIC (UDP) instead of TCP. Enabled via the `httpz.h3` module â€
 ```zig
 const h3 = httpz.h3;
 
-var server = try h3.Server.init(allocator, 4433);
+fn handler(allocator: std.mem.Allocator, request: []const u8) []const u8 {
+    return allocator.dupe(u8, "Hello from H3!") catch "error";
+}
+
+var server = try h3.Server.init(allocator, 4433, handler);
 defer server.deinit();
-try server.run(); // accept loop â€” dispatches to httpz handler
+try server.run(); // accept loop
 ```
 
 ### Client
@@ -510,9 +514,31 @@ const h3 = httpz.h3;
 var client = try h3.Client.init(allocator, "example.com", 443);
 defer client.deinit();
 const body = try client.get("/");
+defer allocator.free(body);
 ```
 
-> **Status:** QUIC handshake and session layer are implemented. Full request/response dispatch is under active development. See `src/h3/` for the current state.
+### TLS Certificates
+
+```zig
+const cert_pem = @embedFile("cert.pem");
+const key_pem = @embedFile("key.pem");
+try h3.quic.setServerCert(cert_pem, key_pem);
+```
+
+### QLog Debugging
+
+```zig
+try h3.quic.enableQLog("trace.qlog"); // Wireshark-compatible
+defer h3.quic.disableQLog();
+```
+
+### Protocol Details
+
+- QUIC transport via ngtcp2 (UDP, TLS 1.3, stream multiplexing)
+- HTTP/3 framing via nghttp3 (QPACK header compression)
+- 0-RTT early data support
+- Connection migration (CID rotation, path validation)
+- QLog output for Wireshark/qvis analysis
 
 ### Dependencies
 
