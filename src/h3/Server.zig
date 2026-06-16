@@ -5,6 +5,7 @@ const ngtcp2 = @import("ngtcp2_c");
 const nghttp3 = @import("nghttp3_c");
 const posix = std.posix;
 
+/// Handler signature matching httpz convention: returns response body as bytes.
 pub const Handler = *const fn (allocator: std.mem.Allocator, request: []const u8) []const u8;
 
 pub const Server = struct {
@@ -26,7 +27,7 @@ pub const Server = struct {
 
     pub fn run(self: *Server) !void {
         var buf: [65536]u8 = undefined;
-        std.debug.print("H3 server listening on UDP port\n", .{});
+        std.debug.print("H3 server listening on UDP\n", .{});
 
         while (true) {
             const n = posix.recvfrom(self.listener.socket, &buf, 0) catch |err| switch (err) {
@@ -37,7 +38,7 @@ pub const Server = struct {
                 else => return error.QuicError,
             };
             if (n < 6) continue;
-            if (buf[0] & 0x80 == 0) continue; // short header
+            if (buf[0] & 0x80 == 0) continue;
 
             const dcid_len: usize = @intCast(buf[5]);
             if (6 + dcid_len > n) continue;
@@ -58,8 +59,6 @@ pub const Server = struct {
     fn handleNewConnection(self: *Server, buf: []u8, n: usize, dcid: [18]u8, dcid_len: usize) !void {
         const scid_ofs = 6 + dcid_len;
         if (scid_ofs + 1 > n) return;
-        const scid_len: usize = @intCast(buf[scid_ofs]);
-        if (scid_ofs + 1 + scid_len > n) return;
 
         var server_scid: ngtcp2.ngtcp2_cid = undefined;
         server_scid.datalen = 18;
@@ -122,52 +121,107 @@ pub const Server = struct {
             std.time.sleep(10 * std.time.ns_per_ms);
         }
 
-        // After handshake, create H3 server session and serve request
+        // After handshake, start H3 session
         self.serveH3(conn) catch |err| {
             std.debug.print("H3 serve error: {s}\n", .{@errorName(err)});
         };
     }
 
+    /// H3 stream type constants (RFC 9114 §6.2)
+    const H3_STREAM_CONTROL: u8 = 0x00;
+    const H3_STREAM_QPACK_ENCODER: u8 = 0x02;
+    const H3_STREAM_QPACK_DECODER: u8 = 0x03;
+
     fn serveH3(self: *Server, conn: *quic.Connection) !void {
-        var h3_session = try http3.Session.initServer(self.allocator);
-        defer h3_session.deinit();
+        var h3 = try http3.Session.initServer(self.allocator);
+        defer h3.deinit();
 
-        // Poll for stream data
         var stream_buf: [65536]u8 = undefined;
-        var served = false;
+        var qpack_enc_bound = false;
+        var qpack_dec_bound = false;
+        var control_bound = false;
+        var requests_served: u32 = 0;
 
-        for (0..100) |_| {
+        // Poll loop: process incoming packets, bind streams, serve requests
+        for (0..500) |_| {
             quic.readPacket(conn) catch {};
             _ = quic.flushPackets(conn) catch {};
 
-            // Check for client-initiated bidi streams (stream_id 0, 4, 8, ...)
+            // Scan all possible QUIC streams for new data
             var stream_id: i64 = 0;
-            while (stream_id < 100) : (stream_id += 4) {
+            while (stream_id < 64) : (stream_id += 1) {
                 var fin: i32 = 0;
                 const sn = ngtcp2.ngtcp2_conn_read_stream(conn.conn, stream_id, &stream_buf, stream_buf.len, &fin);
-                if (sn > 0) {
-                    _ = h3_session.readStream(stream_id, stream_buf[0..@intCast(sn)], fin != 0) catch {};
+
+                if (sn <= 0) continue;
+                const data = stream_buf[0..@intCast(sn)];
+
+                if (isUniStream(stream_id)) {
+                    // Unidirectional stream — detect type and bind
+                    if (data.len == 0) continue;
+                    const stype = data[0];
+
+                    switch (stype) {
+                        H3_STREAM_CONTROL => {
+                            if (!control_bound) {
+                                _ = nghttp3.nghttp3_conn_bind_control_stream(h3.conn, stream_id);
+                                control_bound = true;
+                            }
+                            // Feed remaining data after the type byte
+                            if (data.len > 1) {
+                                _ = h3.readStream(stream_id, data[1..], fin != 0) catch {};
+                            }
+                        },
+                        H3_STREAM_QPACK_ENCODER => {
+                            if (!qpack_enc_bound) {
+                                qpack_enc_bound = true;
+                                // Will bind both when decoder is also seen
+                            }
+                            if (qpack_dec_bound and qpack_enc_bound) {
+                                if (control_bound) {
+                                    // Find encoder and decoder stream IDs
+                                    // For now, stream_id is the encoder
+                                    // Decoder is typically stream_id of the decoder stream
+                                    // Bind with placeholder
+                                }
+                            }
+                        },
+                        H3_STREAM_QPACK_DECODER => {
+                            if (!qpack_dec_bound) {
+                                qpack_dec_bound = true;
+                            }
+                            if (qpack_enc_bound and qpack_dec_bound and control_bound) {
+                                // Bind QPACK: find encoder stream (stream_id where stype was 0x02)
+                                // Skip for now — QPACK binding needs both stream IDs
+                            }
+                        },
+                        else => {
+                            // Unknown unidirectional stream type — ignore
+                        },
+                    }
+                } else if (isBidiClientStream(stream_id)) {
+                    // Client-initiated bidi stream — HTTP request data
+                    _ = h3.readStream(stream_id, data, fin != 0) catch {};
+
+                    // After feeding data, submit response
+                    if (fin != 0 and requests_served < 10) {
+                        const body = self.handler(self.allocator, "H3-request");
+                        h3.submitResponse(stream_id, 200, "", body) catch {};
+                        requests_served += 1;
+                    }
                 }
             }
 
-            // Check if any stream is done (via ResponseContext attached to stream user data)
-            // For now, serve a fixed response on first data
-            if (!served and h3_session.conn != null) {
-                // Check stream 0 for H3 request data
-                var fin0: i32 = 0;
-                const s0 = ngtcp2.ngtcp2_conn_read_stream(conn.conn, 0, &stream_buf, stream_buf.len, &fin0);
-                if (s0 > 0) {
-                    _ = h3_session.readStream(0, stream_buf[0..@intCast(s0)], fin0 != 0) catch {};
-                    // Submit echo response
-                    const body = self.handler(self.allocator, "H3 request");
-                    h3_session.submitResponse(0, 200, "", body) catch {};
-                    _ = quic.flushPackets(conn) catch {};
-                    served = true;
-                }
-            }
-
-            std.time.sleep(10 * std.time.ns_per_ms);
+            std.time.sleep(5 * std.time.ns_per_ms);
         }
+    }
+
+    fn isUniStream(stream_id: i64) bool {
+        return (@as(u64, @intCast(stream_id)) & 0x02) != 0;
+    }
+
+    fn isBidiClientStream(stream_id: i64) bool {
+        return (@as(u64, @intCast(stream_id)) & 0x03) == 0;
     }
 };
 
