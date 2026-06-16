@@ -1,6 +1,8 @@
 const std = @import("std");
 const ngtcp2 = @import("ngtcp2_c");
 const posix = std.posix;
+const builtin = @import("builtin");
+const c = std.c;
 
 const NGTCP2_STREAM_DATA_FLAG_FIN = ngtcp2.NGTCP2_STREAM_DATA_FLAG_FIN;
 
@@ -8,6 +10,67 @@ const max_datagram_size = 65536;
 
 /// Thread-local QLog file descriptor. Set by enableQLog before creating connections.
 pub threadlocal var qlog_fd: posix.fd_t = -1;
+
+/// Sleep for a given number of nanoseconds.
+fn sleepNs(ns: u64) void {
+    const ts = posix.timespec{
+        .sec = @intCast(ns / 1_000_000_000),
+        .nsec = @intCast(ns % 1_000_000_000),
+    };
+    _ = std.c.nanosleep(&ts, null);
+}
+
+/// Server SSL_CTX for QUIC TLS handshake (set by setServerCert).
+var server_ssl_ctx: ?*anyopaque = null;
+
+/// Load a server certificate for QUIC TLS.
+/// Must be called BEFORE creating server connections.
+pub fn setServerCert(cert_pem: []const u8, key_pem: []const u8) !void {
+    const ossl = @import("openssl_c");
+    const ctx = ossl.SSL_CTX_new(ossl.TLS_server_method()) orelse return error.TlsError;
+    errdefer ossl.SSL_CTX_free(ctx);
+
+    // Load certificate
+    const cert_bio = ossl.BIO_new_mem_buf(cert_pem.ptr, @intCast(cert_pem.len)) orelse return error.TlsError;
+    defer _ = ossl.BIO_free(cert_bio);
+    const x509 = ossl.PEM_read_bio_X509(cert_bio, null, null, null) orelse return error.TlsError;
+    if (ossl.SSL_CTX_use_certificate(ctx, x509) != 1) { ossl.X509_free(x509); return error.TlsError; }
+    ossl.X509_free(x509);
+
+    // Load private key
+    const key_bio = ossl.BIO_new_mem_buf(key_pem.ptr, @intCast(key_pem.len)) orelse return error.TlsError;
+    defer _ = ossl.BIO_free(key_bio);
+    const pkey = ossl.PEM_read_bio_PrivateKey(key_bio, null, null, null) orelse return error.TlsError;
+    defer ossl.EVP_PKEY_free(pkey);
+    if (ossl.SSL_CTX_use_PrivateKey(ctx, pkey) != 1) return error.TlsError;
+    if (ossl.SSL_CTX_check_private_key(ctx) != 1) return error.TlsError;
+
+    server_ssl_ctx = @ptrCast(ctx);
+}
+
+/// Custom server-side recv_client_initial that uses our SSL_CTX with cert.
+pub fn serverRecvClientInitialCb(
+    conn: ?*ngtcp2.ngtcp2_conn,
+    conn_ref: ?*ngtcp2.ngtcp2_crypto_conn_ref,
+    _: ?*anyopaque,
+) callconv(.c) ngtcp2.c_int {
+    const ossl = @import("openssl_c");
+    const ctx: *ossl.SSL_CTX = @ptrCast(@alignCast(server_ssl_ctx orelse return @intFromEnum(ngtcp2.NGTCP2_ERR_CALLBACK_FAILURE)));
+    const ssl = ossl.SSL_new(ctx) orelse return @intFromEnum(ngtcp2.NGTCP2_ERR_CALLBACK_FAILURE);
+    ossl.SSL_set_accept_state(ssl);
+
+    var ossl_ctx: ?*ngtcp2.ngtcp2_crypto_ossl_ctx = null;
+    const ret = ngtcp2.ngtcp2_crypto_ossl_ctx_new(&ossl_ctx, ssl);
+    if (ret != 0) {
+        ossl.SSL_free(ssl);
+        return ret;
+    }
+    ngtcp2.ngtcp2_crypto_ossl_ctx_set_ssl(ossl_ctx.?, ssl);
+    conn_ref.?.user_data = @ptrCast(ossl_ctx.?);
+
+    _ = conn;
+    return 0;
+}
 
 pub fn qlogWriteCb(
     user_data: ?*anyopaque,
@@ -18,21 +81,21 @@ pub fn qlogWriteCb(
     _ = user_data;
     if (qlog_fd < 0) return;
     if (data) |d| {
-        _ = posix.write(qlog_fd, @as([*]const u8, @ptrCast(d))[0..datalen]) catch {};
+        _ = std.c.write(qlog_fd, @as([*]const u8, @ptrCast(d)), datalen);
     }
 }
 
 /// Enable QLog debugging output to the given file path.
 /// Must be called BEFORE creating QUIC connections.
 pub fn enableQLog(path: []const u8) !void {
-    const fd = try posix.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+    const fd = try posix.openat(posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
     qlog_fd = fd;
 }
 
 /// Disable QLog and close the file.
 pub fn disableQLog() void {
     if (qlog_fd >= 0) {
-        _ = posix.close(qlog_fd);
+        _ = std.c.close(qlog_fd);
         qlog_fd = -1;
     }
 }
@@ -55,12 +118,12 @@ pub const Connection = struct {
 
     pub fn deinit(self: *Connection) void {
         ngtcp2.ngtcp2_conn_del(self.conn);
-        posix.close(self.socket);
+        _ = std.c.close(self.socket);
         if (self.stream_ctx_alloc) |ptr| {
             std.heap.page_allocator.destroy(ptr);
         }
         if (self.qlog_fd) |fd| {
-            _ = posix.close(fd);
+            _ = std.c.close(fd);
         }
         self.* = undefined;
     }
@@ -101,18 +164,18 @@ pub fn handleExpiry(conn: *Connection) Error!void {
 
 fn nowNanos() u64 {
     var ts: posix.timespec = undefined;
-    posix.clock_gettime(posix.CLOCK.MONOTONIC, &ts) catch unreachable;
-    return @as(u64, @intCast(ts.tv_sec)) * 1_000_000_000 + @as(u64, @intCast(ts.tv_nsec));
+    _ = std.c.clock_gettime(posix.CLOCK.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
 }
 
 /// Read a UDP packet and feed it to the QUIC connection.
 pub fn readPacket(conn: *Connection) Error!void {
-    const n = posix.recvfrom(conn.socket, &conn.buf, 0) catch |err| switch (err) {
-        error.WouldBlock => return,
-        else => return error.QuicError,
-    };
+    const n = std.c.recvfrom(conn.socket, &conn.buf, conn.buf.len, 0, null, null);
+    if (n < 0) return;
+    const data = conn.buf[0..@intCast(n)];
     const pkt = ngtcp2.ngtcp2_pkt_info{};
-    const ret = ngtcp2.ngtcp2_conn_read_pkt(conn.conn, &.{ .local = .{}, .remote = .{} }, &pkt, conn.buf[0..n], nowNanos());
+    var path: ngtcp2.ngtcp2_path = .{ .local = .{ .addr = undefined, .addrlen = 0 }, .remote = .{ .addr = undefined, .addrlen = 0 } };
+    const ret = ngtcp2.ngtcp2_conn_read_pkt(conn.conn, &path, &pkt, data.ptr, data.len, nowNanos());
     if (ret != 0) return error.QuicError;
 }
 
@@ -126,24 +189,52 @@ pub fn flushPackets(conn: *Connection) Error!void {
             if (n == @intFromEnum(ngtcp2.NGTCP2_ERR_WOULDBLOCK)) return;
             return error.QuicError;
         }
-        _ = posix.sendto(conn.socket, conn.buf[0..@intCast(n)], 0, dest.remote.addr orelse return error.QuicError, dest.remote.addrlen) catch return error.QuicError;
+        const sent = std.c.sendto(conn.socket, conn.buf[0..@intCast(n)].ptr, @intCast(n), 0, dest.remote.addr orelse return error.QuicError, dest.remote.addrlen);
+        if (sent < 0) return error.QuicError;
     }
+}
+
+/// Resolve a hostname to an IPv4 address (network byte order u32).
+fn resolveHostIp(host: []const u8, port: u16) !u32 {
+    const host_z = try std.heap.page_allocator.dupeZ(u8, host);
+    defer std.heap.page_allocator.free(host_z);
+
+    var port_buf: [6]u8 = undefined;
+    const port_z = try std.fmt.bufPrintZ(&port_buf, "{d}", .{port});
+
+    var hints: std.c.addrinfo = std.mem.zeroes(std.c.addrinfo);
+    hints.family = posix.AF.INET;
+    hints.socktype = posix.SOCK.DGRAM;
+    hints.protocol = posix.IPPROTO.UDP;
+
+    var res: ?*std.c.addrinfo = null;
+    const rc = std.c.getaddrinfo(host_z, port_z, &hints, &res);
+    if (rc != 0) return error.QuicError;
+    defer std.c.freeaddrinfo(res.?);
+
+    const addr = res.?.addr orelse return error.QuicError;
+    const in_addr: *const posix.sockaddr.in = @ptrCast(@alignCast(addr));
+    return in_addr.addr;
 }
 
 /// Create a QUIC client connection and perform handshake over UDP.
 /// If `stream_ctx` is provided, installs recv_stream_data callback.
 /// If `early_data` is provided (from a previous connection), enables 0-RTT.
 pub fn connect(host: []const u8, port: u16, stream_ctx: ?StreamDataCtx, early_data: ?[]const u8) Error!Connection {
-    const addr = try posix.getAddressList(std.heap.page_allocator, host, port);
-    defer addr.deinit();
+    const server_ip = try resolveHostIp(host, port);
 
-    const sock = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM, posix.IPPROTO.UDP);
-    errdefer posix.close(sock);
+    const sock: posix.fd_t = @intCast(std.c.socket(
+        @as(u32, @intFromEnum(posix.AF.INET)),
+        @as(u32, @intFromEnum(posix.SOCK.DGRAM)),
+        @as(u32, @intFromEnum(posix.IPPROTO.UDP)),
+    ));
+    if (sock < 0) return error.QuicError;
+    errdefer _ = std.c.close(sock);
 
     const server_addr = posix.sockaddr.in{
         .family = posix.AF.INET,
         .port = @byteSwap(port),
-        .addr = addr.addrs[0].in.sa.addr,
+        .addr = server_ip,
         .zero = @splat(0),
     };
 
@@ -152,8 +243,8 @@ pub fn connect(host: []const u8, port: u16, stream_ctx: ?StreamDataCtx, early_da
     var scid: ngtcp2.ngtcp2_cid = undefined;
     dcid.datalen = 18;
     scid.datalen = 18;
-    posix.getrandom(dcid.data[0..18]) catch unreachable;
-    posix.getrandom(scid.data[0..18]) catch unreachable;
+    std.c.arc4random_buf(@ptrCast(&dcid.data), 18);
+    std.c.arc4random_buf(@ptrCast(&scid.data), 18);
 
     var callbacks: ngtcp2.ngtcp2_callbacks = undefined;
     ngtcp2.ngtcp2_callbacks_default(&callbacks);
@@ -228,7 +319,7 @@ pub fn connect(host: []const u8, port: u16, stream_ctx: ?StreamDataCtx, early_da
     for (0..10) |_| {
         readPacket(&self) catch {};
         _ = flushPackets(&self) catch {};
-        std.time.sleep(10 * std.time.ns_per_ms);
+        sleepNs(10 * std.time.ns_per_ms);
     }
 
     return self;
@@ -252,16 +343,18 @@ pub const Listener = struct {
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator, port: u16) Error!Listener {
-        const sock = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM, posix.IPPROTO.UDP);
-        errdefer posix.close(sock);
+        const sock: posix.fd_t = @intCast(std.c.socket(2, 2, 17));
+        if (sock < 0) return error.QuicError;
+        errdefer _ = std.c.close(sock);
 
         const addr = posix.sockaddr.in{
             .family = posix.AF.INET,
             .port = @byteSwap(port),
-            .addr = posix.inAddrAny,
+            .addr = 0, // INADDR_ANY
             .zero = @splat(0),
         };
-        try posix.bind(sock, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
+        const rc = std.c.bind(sock, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
+        if (rc < 0) return error.QuicError;
 
         return .{
             .socket = sock,
@@ -277,7 +370,7 @@ pub const Listener = struct {
             self.allocator.destroy(entry.value_ptr.*);
         }
         self.connections.deinit();
-        posix.close(self.socket);
+        _ = std.c.close(self.socket);
     }
 };
 
@@ -294,7 +387,7 @@ pub fn getNewConnIdCb(
     _ = conn;
     const listener: ?*Listener = @ptrCast(@alignCast(user_data));
     cid.?.datalen = 18;
-    posix.getrandom(cid.?.data[0..18]) catch return @intFromEnum(ngtcp2.NGTCP2_ERR_CALLBACK_FAILURE);
+    std.c.arc4random_buf(@ptrCast(&cid.?.data), 18);
 
     // Register in server CID routing table
     if (listener) |l| {

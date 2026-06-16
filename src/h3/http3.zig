@@ -34,8 +34,7 @@ pub const Session = struct {
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) !Session {
-        var callbacks: nghttp3.nghttp3_callbacks = undefined;
-        nghttp3.nghttp3_callbacks_default(&callbacks);
+        var callbacks: nghttp3.nghttp3_callbacks = std.mem.zeroes(nghttp3.nghttp3_callbacks);
 
         // Set response accumulation callbacks
         callbacks.recv_header = recvHeaderCb;
@@ -55,8 +54,7 @@ pub const Session = struct {
 
     /// Create a server-side H3 session (for use in H3 server).
     pub fn initServer(allocator: std.mem.Allocator) !Session {
-        var callbacks: nghttp3.nghttp3_callbacks = undefined;
-        nghttp3.nghttp3_callbacks_default(&callbacks);
+        var callbacks: nghttp3.nghttp3_callbacks = std.mem.zeroes(nghttp3.nghttp3_callbacks);
 
         callbacks.recv_header = recvHeaderCb;
         callbacks.recv_data = recvDataCb;
@@ -132,7 +130,7 @@ fn recvHeaderCb(
     _: u8,
     _: ?*anyopaque,
     stream_user_data: ?*anyopaque,
-) callconv(.c) nghttp3.c_int {
+) callconv(.c) c_int {
     if (stream_user_data) |ud| {
         const ctx: *ResponseContext = @alignCast(@ptrCast(ud));
         const nv = nghttp3.nghttp3_rcbuf_get_buf(name.?);
@@ -152,7 +150,7 @@ fn recvDataCb(
     datalen: usize,
     _: ?*anyopaque,
     stream_user_data: ?*anyopaque,
-) callconv(.c) nghttp3.c_int {
+) callconv(.c) c_int {
     if (stream_user_data) |ud| {
         const ctx: *ResponseContext = @alignCast(@ptrCast(ud));
         ctx.body.appendSlice(data[0..datalen]) catch return @intFromEnum(nghttp3.NGHTTP3_ERR_CALLBACK_FAILURE);
@@ -165,7 +163,7 @@ fn endStreamCb(
     _: i64,
     _: ?*anyopaque,
     stream_user_data: ?*anyopaque,
-) callconv(.c) nghttp3.c_int {
+) callconv(.c) c_int {
     if (stream_user_data) |ud| {
         const ctx: *ResponseContext = @alignCast(@ptrCast(ud));
         ctx.done = true;

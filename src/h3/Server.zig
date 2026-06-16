@@ -5,6 +5,15 @@ const ngtcp2 = @import("ngtcp2_c");
 const nghttp3 = @import("nghttp3_c");
 const posix = std.posix;
 
+/// Sleep for a given number of nanoseconds.
+fn sleepNs(ns: u64) void {
+    const req = posix.timespec{
+        .sec = @intCast(ns / 1_000_000_000),
+        .nsec = @intCast(ns % 1_000_000_000),
+    };
+    _ = std.c.nanosleep(@ptrCast(&req), null);
+}
+
 /// Handler signature matching httpz convention: returns response body as bytes.
 pub const Handler = *const fn (allocator: std.mem.Allocator, request: []const u8) []const u8;
 
@@ -30,24 +39,24 @@ pub const Server = struct {
         std.debug.print("H3 server listening on UDP\n", .{});
 
         while (true) {
-            const n = posix.recvfrom(self.listener.socket, &buf, 0) catch |err| switch (err) {
-                error.WouldBlock => {
-                    std.time.sleep(10 * std.time.ns_per_ms);
-                    continue;
-                },
-                else => return error.QuicError,
-            };
+            const n = std.c.recvfrom(self.listener.socket, &buf, buf.len, 0, null, null);
+            if (n < 0) {
+                sleepNs(10 * std.time.ns_per_ms);
+                continue;
+            }
             if (n < 6) continue;
             if (buf[0] & 0x80 == 0) continue;
 
             const dcid_len: usize = @intCast(buf[5]);
-            if (6 + dcid_len > n) continue;
+            if (6 + dcid_len > @as(usize, @intCast(n))) continue;
             var dcid: [18]u8 = @splat(0);
             @memcpy(dcid[0..@min(dcid_len, @as(usize, 18))], buf[6..][0..@min(dcid_len, @as(usize, 18))]);
 
             if (self.listener.connections.get(dcid)) |conn| {
+                const data = buf[0..@intCast(n)];
                 const pkt = ngtcp2.ngtcp2_pkt_info{};
-                _ = ngtcp2.ngtcp2_conn_read_pkt(conn.conn, &.{ .local = .{}, .remote = .{} }, &pkt, buf[0..n], nowNanos());
+                var path: ngtcp2.ngtcp2_path = .{ .local = .{ .addr = undefined, .addrlen = 0 }, .remote = .{ .addr = undefined, .addrlen = 0 } };
+                _ = ngtcp2.ngtcp2_conn_read_pkt(conn.conn, &path, &pkt, data.ptr, data.len, nowNanos());
                 _ = quic.flushPackets(conn) catch {};
                 continue;
             }
@@ -62,7 +71,7 @@ pub const Server = struct {
 
         var server_scid: ngtcp2.ngtcp2_cid = undefined;
         server_scid.datalen = 18;
-        posix.getrandom(server_scid.data[0..18]) catch unreachable;
+        std.c.arc4random_buf(@ptrCast(&server_scid.data), 18);
 
         var client_dcid: ngtcp2.ngtcp2_cid = undefined;
         client_dcid.datalen = @intCast(@min(dcid_len, @as(usize, 18)));
@@ -70,7 +79,7 @@ pub const Server = struct {
 
         var callbacks: ngtcp2.ngtcp2_callbacks = undefined;
         ngtcp2.ngtcp2_callbacks_default(&callbacks);
-        callbacks.recv_client_initial = ngtcp2.ngtcp2_crypto_recv_client_initial_cb;
+        callbacks.recv_client_initial = quic.serverRecvClientInitialCb;
         callbacks.recv_crypto_data = ngtcp2.ngtcp2_crypto_recv_crypto_data_cb;
         callbacks.encrypt = ngtcp2.ngtcp2_crypto_encrypt_cb;
         callbacks.decrypt = ngtcp2.ngtcp2_crypto_decrypt_cb;
@@ -109,7 +118,9 @@ pub const Server = struct {
         errdefer ngtcp2.ngtcp2_conn_del(conn_ptr.?);
 
         const pkt = ngtcp2.ngtcp2_pkt_info{};
-        _ = ngtcp2.ngtcp2_conn_read_pkt(conn_ptr.?, &.{ .local = .{}, .remote = .{} }, &pkt, buf[0..n], nowNanos());
+        const init_data = buf[0..n];
+        var init_path: ngtcp2.ngtcp2_path = .{ .local = .{ .addr = undefined, .addrlen = 0 }, .remote = .{ .addr = undefined, .addrlen = 0 } };
+        _ = ngtcp2.ngtcp2_conn_read_pkt(conn_ptr.?, &init_path, &pkt, init_data.ptr, init_data.len, nowNanos());
 
         const conn = try self.allocator.create(quic.Connection);
         conn.* = quic.Connection{
@@ -124,7 +135,7 @@ pub const Server = struct {
         for (0..20) |_| {
             quic.readPacket(conn) catch {};
             _ = quic.flushPackets(conn) catch {};
-            std.time.sleep(10 * std.time.ns_per_ms);
+            sleepNs(10 * std.time.ns_per_ms);
         }
 
         // After handshake, start H3 session
@@ -204,7 +215,7 @@ pub const Server = struct {
                 }
             }
 
-            std.time.sleep(5 * std.time.ns_per_ms);
+            sleepNs(5 * std.time.ns_per_ms);
         }
     }
 
@@ -225,8 +236,8 @@ pub const Server = struct {
 
 fn nowNanos() u64 {
     var ts: posix.timespec = undefined;
-    posix.clock_gettime(posix.CLOCK.MONOTONIC, &ts) catch unreachable;
-    return @as(u64, @intCast(ts.tv_sec)) * 1_000_000_000 + @as(u64, @intCast(ts.tv_nsec));
+    _ = std.c.clock_gettime(posix.CLOCK.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
 }
 
 test "H3 Server init/deinit" {

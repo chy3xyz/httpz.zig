@@ -105,6 +105,21 @@ pub fn build(b: *std.Build) void {
     const integration_step = b.step("test-integration", "Run integration tests");
     integration_step.dependOn(&run_integration_tests.step);
 
+    // H3 integration tests (need cert + UDP networking)
+    const h3_integration_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/h3_integration.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "httpz", .module = httpz_mod },
+            },
+        }),
+    });
+    const run_h3_tests = b.addRunArtifact(h3_integration_tests);
+    const h3_test_step = b.step("test-h3", "Run H3 integration tests");
+    h3_test_step.dependOn(&run_h3_tests.step);
+
     // Test step
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_mod_tests.step);
