@@ -80,6 +80,9 @@ pub const Server = struct {
         callbacks.delete_crypto_cipher_ctx = ngtcp2.ngtcp2_crypto_delete_crypto_cipher_ctx_cb;
         callbacks.get_path_challenge_data = ngtcp2.ngtcp2_crypto_get_path_challenge_data_cb;
         callbacks.version_negotiation = ngtcp2.ngtcp2_crypto_version_negotiation_cb;
+        callbacks.get_new_connection_id = quic.getNewConnIdCb;
+        callbacks.remove_connection_id = quic.removeConnIdCb;
+        callbacks.path_validation = quic.pathValidationCb;
 
         var settings: ngtcp2.ngtcp2_settings = undefined;
         ngtcp2.ngtcp2_settings_default(&settings);
