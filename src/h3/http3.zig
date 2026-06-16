@@ -61,7 +61,7 @@ pub const Session = struct {
         callbacks.end_stream = endStreamCb;
 
         var conn_ptr: ?*nghttp3.nghttp3_conn = null;
-        const ret = nghttp3.nghttp3_conn_server_new(&conn_ptr, &callbacks, null, null);
+        const ret = nghttp3.nghttp3_conn_server_new(&conn_ptr, &callbacks, null, null, null);
         if (ret != 0) return error.H3Error;
 
         return .{
