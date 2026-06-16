@@ -5,14 +5,18 @@ const ngtcp2 = @import("ngtcp2_c");
 const nghttp3 = @import("nghttp3_c");
 const posix = std.posix;
 
+pub const Handler = *const fn (allocator: std.mem.Allocator, request: []const u8) []const u8;
+
 pub const Server = struct {
     listener: quic.Listener,
     allocator: std.mem.Allocator,
+    handler: Handler,
 
-    pub fn init(allocator: std.mem.Allocator, port: u16) !Server {
+    pub fn init(allocator: std.mem.Allocator, port: u16, handler: Handler) !Server {
         return .{
             .listener = try quic.Listener.init(allocator, port),
             .allocator = allocator,
+            .handler = handler,
         };
     }
 
@@ -20,8 +24,6 @@ pub const Server = struct {
         self.listener.deinit();
     }
 
-    /// Accept loop — receives QUIC packets, creates server connections,
-    /// and echoes "Hello from H3!" for any HTTP/3 request.
     pub fn run(self: *Server) !void {
         var buf: [65536]u8 = undefined;
         std.debug.print("H3 server listening on UDP port\n", .{});
@@ -34,44 +36,31 @@ pub const Server = struct {
                 },
                 else => return error.QuicError,
             };
-
             if (n < 6) continue;
-
-            // Parse DCID from QUIC long header packet
-            // Byte 0: flags (0x80 = long header)
-            if (buf[0] & 0x80 == 0) continue; // not a long header
+            if (buf[0] & 0x80 == 0) continue; // short header
 
             const dcid_len: usize = @intCast(buf[5]);
             if (6 + dcid_len > n) continue;
-
             var dcid: [18]u8 = @splat(0);
             @memcpy(dcid[0..@min(dcid_len, @as(usize, 18))], buf[6..][0..@min(dcid_len, @as(usize, 18))]);
 
-            // Try existing connection first
             if (self.listener.connections.get(dcid)) |conn| {
-                // Feed packet to existing connection
                 const pkt = ngtcp2.ngtcp2_pkt_info{};
                 _ = ngtcp2.ngtcp2_conn_read_pkt(conn.conn, &.{ .local = .{}, .remote = .{} }, &pkt, buf[0..n], nowNanos());
                 _ = quic.flushPackets(conn) catch {};
                 continue;
             }
 
-            // New connection — create server QUIC connection
-            try self.handleNewConnection(&buf, n, dcid);
+            try self.handleNewConnection(buf, n, dcid, dcid_len);
         }
     }
 
-    fn handleNewConnection(self: *Server, buf: []u8, n: usize, dcid: [18]u8) !void {
-        const dcid_len: usize = @intCast(buf[5]);
+    fn handleNewConnection(self: *Server, buf: []u8, n: usize, dcid: [18]u8, dcid_len: usize) !void {
         const scid_ofs = 6 + dcid_len;
         if (scid_ofs + 1 > n) return;
         const scid_len: usize = @intCast(buf[scid_ofs]);
         if (scid_ofs + 1 + scid_len > n) return;
 
-        var scid: [18]u8 = @splat(0);
-        @memcpy(scid[0..@min(scid_len, @as(usize, 18))], buf[scid_ofs + 1 ..][0..@min(scid_len, @as(usize, 18))]);
-
-        // Generate server SCID
         var server_scid: ngtcp2.ngtcp2_cid = undefined;
         server_scid.datalen = 18;
         posix.getrandom(server_scid.data[0..18]) catch unreachable;
@@ -80,11 +69,6 @@ pub const Server = struct {
         client_dcid.datalen = @intCast(@min(dcid_len, @as(usize, 18)));
         @memcpy(client_dcid.data[0..client_dcid.datalen], dcid[0..client_dcid.datalen]);
 
-        var client_scid: ngtcp2.ngtcp2_cid = undefined;
-        client_scid.datalen = @intCast(@min(scid_len, @as(usize, 18)));
-        @memcpy(client_scid.data[0..client_scid.datalen], scid[0..client_scid.datalen]);
-
-        // Set up server callbacks
         var callbacks: ngtcp2.ngtcp2_callbacks = undefined;
         ngtcp2.ngtcp2_callbacks_default(&callbacks);
         callbacks.recv_client_initial = ngtcp2.ngtcp2_crypto_recv_client_initial_cb;
@@ -117,19 +101,17 @@ pub const Server = struct {
         var conn_ptr: ?*ngtcp2.ngtcp2_conn = null;
         const ret = ngtcp2.ngtcp2_conn_server_new(&conn_ptr, &client_dcid, &server_scid, &path, ngtcp2.NGTCP2_PROTO_VER_V1, &callbacks, &settings, &params, null, null);
         if (ret != 0) return error.QuicError;
+        errdefer ngtcp2.ngtcp2_conn_del(conn_ptr.?);
 
-        // Read the initial packet into the new connection
         const pkt = ngtcp2.ngtcp2_pkt_info{};
         _ = ngtcp2.ngtcp2_conn_read_pkt(conn_ptr.?, &.{ .local = .{}, .remote = .{} }, &pkt, buf[0..n], nowNanos());
 
-        // Create Connection wrapper and store
         const conn = try self.allocator.create(quic.Connection);
         conn.* = quic.Connection{
             .conn = conn_ptr.?,
             .socket = self.listener.socket,
         };
 
-        // Store by both DCID and SCID for routing
         try self.listener.connections.put(server_scid.data, conn);
         _ = try quic.flushPackets(conn);
 
@@ -140,7 +122,52 @@ pub const Server = struct {
             std.time.sleep(10 * std.time.ns_per_ms);
         }
 
-        std.debug.print("H3: new QUIC connection established\n", .{});
+        // After handshake, create H3 server session and serve request
+        self.serveH3(conn) catch |err| {
+            std.debug.print("H3 serve error: {s}\n", .{@errorName(err)});
+        };
+    }
+
+    fn serveH3(self: *Server, conn: *quic.Connection) !void {
+        var h3_session = try http3.Session.initServer(self.allocator);
+        defer h3_session.deinit();
+
+        // Poll for stream data
+        var stream_buf: [65536]u8 = undefined;
+        var served = false;
+
+        for (0..100) |_| {
+            quic.readPacket(conn) catch {};
+            _ = quic.flushPackets(conn) catch {};
+
+            // Check for client-initiated bidi streams (stream_id 0, 4, 8, ...)
+            var stream_id: i64 = 0;
+            while (stream_id < 100) : (stream_id += 4) {
+                var fin: i32 = 0;
+                const sn = ngtcp2.ngtcp2_conn_read_stream(conn.conn, stream_id, &stream_buf, stream_buf.len, &fin);
+                if (sn > 0) {
+                    _ = h3_session.readStream(stream_id, stream_buf[0..@intCast(sn)], fin != 0) catch {};
+                }
+            }
+
+            // Check if any stream is done (via ResponseContext attached to stream user data)
+            // For now, serve a fixed response on first data
+            if (!served and h3_session.conn != null) {
+                // Check stream 0 for H3 request data
+                var fin0: i32 = 0;
+                const s0 = ngtcp2.ngtcp2_conn_read_stream(conn.conn, 0, &stream_buf, stream_buf.len, &fin0);
+                if (s0 > 0) {
+                    _ = h3_session.readStream(0, stream_buf[0..@intCast(s0)], fin0 != 0) catch {};
+                    // Submit echo response
+                    const body = self.handler(self.allocator, "H3 request");
+                    h3_session.submitResponse(0, 200, "", body) catch {};
+                    _ = quic.flushPackets(conn) catch {};
+                    served = true;
+                }
+            }
+
+            std.time.sleep(10 * std.time.ns_per_ms);
+        }
     }
 };
 

@@ -53,6 +53,26 @@ pub const Session = struct {
         };
     }
 
+    /// Create a server-side H3 session (for use in H3 server).
+    pub fn initServer(allocator: std.mem.Allocator) !Session {
+        var callbacks: nghttp3.nghttp3_callbacks = undefined;
+        nghttp3.nghttp3_callbacks_default(&callbacks);
+
+        callbacks.recv_header = recvHeaderCb;
+        callbacks.recv_data = recvDataCb;
+        callbacks.end_stream = endStreamCb;
+
+        var conn_ptr: ?*nghttp3.nghttp3_conn = null;
+        const ret = nghttp3.nghttp3_conn_server_new(&conn_ptr, &callbacks, null, null);
+        if (ret != 0) return error.H3Error;
+
+        return .{
+            .conn = conn_ptr.?,
+            .callbacks = callbacks,
+            .allocator = allocator,
+        };
+    }
+
     pub fn deinit(self: *Session) void {
         nghttp3.nghttp3_conn_del(self.conn);
         self.* = undefined;
