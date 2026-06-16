@@ -193,7 +193,7 @@ pub fn close(self: *Client) void {
         self.tls_conn = null;
     }
     if (self.stream) |stream| {
-        std.posix.close(stream.socket.handle);
+        _ = std.posix.system.close(stream.socket.handle);
         self.stream = null;
     }
 }
