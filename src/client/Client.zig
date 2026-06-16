@@ -117,10 +117,11 @@ stream_writer: ?Io.net.Stream.Writer = null,
 tls_reader_stream: ?tls.Connection.Reader = null,
 tls_read_buf_stream: [8192]u8 = undefined,
 
-pub fn init(allocator: std.mem.Allocator, config: Config) Client {
+pub fn init(allocator: std.mem.Allocator, config: Config) error{OutOfMemory}!Client {
     const buf_size = @max(config.read_buffer_size, config.write_buffer_size);
-    const read_buf = allocator.alloc(u8, buf_size) catch unreachable;
-    const write_buf = allocator.alloc(u8, buf_size) catch unreachable;
+    const read_buf = try allocator.alloc(u8, buf_size);
+    errdefer allocator.free(read_buf);
+    const write_buf = try allocator.alloc(u8, buf_size);
     return .{
         .config = config,
         .read_buf = read_buf,
@@ -191,7 +192,8 @@ pub fn close(self: *Client) void {
         tc.deinit();
         self.tls_conn = null;
     }
-    if (self.stream) |_| {
+    if (self.stream) |stream| {
+        std.posix.close(stream.socket.handle);
         self.stream = null;
     }
 }
@@ -832,7 +834,7 @@ test "Client: Url.parse no path" {
 test "Client: download from httpbin.org" {
     const test_url = Url.parse("http://httpbin.org/html").?;
 
-    var client = Client.init(std.testing.allocator, .{
+    var client = try Client.init(std.testing.allocator, .{
         .host = test_url.host,
         .port = test_url.port,
         .connection_timeout_s = 10,

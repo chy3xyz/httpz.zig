@@ -116,6 +116,13 @@ pub const config = struct {
     };
 };
 
+pub const ConnectionError = error{
+    TlsAlert,
+    EndOfStream,
+    WouldBlock,
+    ReadFailed,
+};
+
 pub const Connection = struct {
     ssl: *c.SSL,
     ctx: *c.SSL_CTX,
@@ -128,7 +135,7 @@ pub const Connection = struct {
     read_buf: [16384]u8 = undefined,
 
     /// Returns next chunk of cleartext data, or null on end of stream.
-    pub fn next(conn: *Connection) anyerror!?[]const u8 {
+    pub fn next(conn: *Connection) ConnectionError!?[]const u8 {
         const ret = c.SSL_read(conn.ssl, &conn.read_buf, @intCast(conn.read_buf.len));
         if (ret <= 0) {
             const err = c.SSL_get_error(conn.ssl, ret);
@@ -140,7 +147,7 @@ pub const Connection = struct {
     }
 
     /// Encrypt and write all data to the underlying connection.
-    pub fn writeAll(conn: *Connection, data: []const u8) !void {
+    pub fn writeAll(conn: *Connection, data: []const u8) ConnectionError!void {
         var offset: usize = 0;
         while (offset < data.len) {
             const remaining = data.len - offset;
@@ -155,7 +162,7 @@ pub const Connection = struct {
     }
 
     /// Read decrypted data into the provided buffer.
-    pub fn read(conn: *Connection, buf: []u8) !usize {
+    pub fn read(conn: *Connection, buf: []u8) ConnectionError!usize {
         if (buf.len == 0) return 0;
         const ret = c.SSL_read(conn.ssl, @ptrCast(buf.ptr), @intCast(@min(buf.len, 16384)));
         if (ret <= 0) {
@@ -588,7 +595,7 @@ fn mapSslHandshakeError(ssl: *c.SSL) error{
     return error.TlsHandshakeFailure;
 }
 
-fn sslToError(ssl_error: c_int) anyerror {
+fn sslToError(ssl_error: c_int) ConnectionError {
     return switch (ssl_error) {
         c.SSL_ERROR_ZERO_RETURN => error.EndOfStream,
         c.SSL_ERROR_WANT_READ, c.SSL_ERROR_WANT_WRITE => error.WouldBlock,

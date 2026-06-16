@@ -114,8 +114,12 @@ fn serveImpl(reader: *Io.Reader, writer: *Io.Writer, handler: Handler, io: Io) !
     var pending_header_block: [16384]u8 = undefined;
     var pending_header_block_len: usize = 0;
     var pending_stream_id: u31 = 0;
-    var body_buf: [1_048_576]u8 = undefined; // 1 MiB max body
+    // Request body buffer: stack for ≤64 KiB, heap for larger.
+    const max_stack_body: usize = 65536;
+    var body_stack_buf: [max_stack_body]u8 = undefined;
+    var body_heap: ?[]u8 = null;
     var body_len: usize = 0;
+    defer if (body_heap) |h| std.heap.page_allocator.free(h);
 
     // Track last stream ID for GOAWAY (also used by deferred graceful shutdown)
     var last_client_stream_id: u31 = 0;
@@ -375,7 +379,9 @@ fn serveImpl(reader: *Io.Reader, writer: *Io.Writer, handler: Handler, io: Io) !
 
                 // Buffer request body data
                 if (actual_data.len > 0 and pending_stream_id == f.header.stream_id) {
-                    if (body_len + actual_data.len > body_buf.len) {
+                    const total = body_len + actual_data.len;
+                    const max_body: usize = 1_048_576; // 1 MiB max body
+                    if (total > max_body) {
                         try frame.writeRstStream(writer, f.header.stream_id, .refused_stream);
                         try writer.flush();
                         body_len = 0;
@@ -383,7 +389,38 @@ fn serveImpl(reader: *Io.Reader, writer: *Io.Writer, handler: Handler, io: Io) !
                         pending_header_block_len = 0;
                         continue;
                     }
-                    @memcpy(body_buf[body_len..][0..actual_data.len], actual_data);
+
+                    // Grow buffer if needed
+                    if (body_heap) |h| {
+                        if (total > h.len) {
+                            const new_buf = std.heap.page_allocator.alloc(u8, total) catch {
+                                try frame.writeRstStream(writer, f.header.stream_id, .refused_stream);
+                                try writer.flush();
+                                body_len = 0;
+                                pending_stream_id = 0;
+                                pending_header_block_len = 0;
+                                continue;
+                            };
+                            @memcpy(new_buf[0..body_len], h[0..body_len]);
+                            std.heap.page_allocator.free(h);
+                            body_heap = new_buf;
+                        }
+                    } else if (total > body_stack_buf.len) {
+                        // Migrate to heap
+                        const new_buf = std.heap.page_allocator.alloc(u8, total) catch {
+                            try frame.writeRstStream(writer, f.header.stream_id, .refused_stream);
+                            try writer.flush();
+                            body_len = 0;
+                            pending_stream_id = 0;
+                            pending_header_block_len = 0;
+                            continue;
+                        };
+                        @memcpy(new_buf[0..body_len], body_stack_buf[0..body_len]);
+                        body_heap = new_buf;
+                    }
+
+                    const target = if (body_heap) |h| h else &body_stack_buf;
+                    @memcpy(target[body_len..][0..actual_data.len], actual_data);
                     body_len += actual_data.len;
                 }
 
@@ -401,7 +438,7 @@ fn serveImpl(reader: *Io.Reader, writer: *Io.Writer, handler: Handler, io: Io) !
                         &registry, &decoder, &encoder, &flow,
                         &settings_sync.peer,
                         pending_header_block[0..pending_header_block_len],
-                        pending_stream_id, body_buf[0..body_len],
+                        pending_stream_id, if (body_heap) |h| h[0..body_len] else body_stack_buf[0..body_len],
                         writer, handler, io,
                     );
                     pending_stream_id = 0;

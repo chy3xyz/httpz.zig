@@ -12,7 +12,7 @@ pub fn main(init: std.process.Init) !void {
 
     std.debug.print("Connecting to {s}:{}...\n", .{ url.host, url.port });
 
-    var client = Client.init(allocator, .{
+    var client = try Client.init(allocator, .{
         .host = url.host,
         .port = url.port,
         .connection_timeout_s = 10,

@@ -170,6 +170,7 @@ fn spawnServer(comptime handler: *const fn (std.mem.Allocator, std.Io, *const ht
     const T = struct {
         fn run(p: u16) void {
             var threaded = Io.Threaded.init(std.heap.page_allocator, .{});
+            defer threaded.deinit();
             const tio = threaded.io();
             var server = httpz.Server.init(.{
                 .port = p,
@@ -187,6 +188,7 @@ fn spawnServer(comptime handler: *const fn (std.mem.Allocator, std.Io, *const ht
 fn waitForPort(port: u16) void {
     // Create a temporary Io for connect probing
     var threaded = Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
     const io = threaded.io();
 
     var i: u32 = 0;
@@ -205,7 +207,9 @@ fn waitForPort(port: u16) void {
 
 /// Make a raw HTTP request and return the full response bytes.
 fn rawRequest(port: u16, request_bytes: []const u8) ![]const u8 {
-    const io = std.testing.io;
+    var threaded = Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const addr = Io.net.IpAddress.parseIp4("127.0.0.1", port) catch return error.ConnectionFailed;
     const stream = Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.ConnectionFailed;
     defer stream.close(io);
@@ -224,16 +228,29 @@ fn rawRequest(port: u16, request_bytes: []const u8) ![]const u8 {
 
 /// Create a connected client to the given port.
 fn connectClient(port: u16) !httpz.Client {
-    var client = httpz.Client.init(testing.allocator, .{
+    const io = getTestIo();
+    var client = try httpz.Client.init(testing.allocator, .{
         .host = "127.0.0.1",
         .port = port,
         .read_timeout_s = 5,
     });
-    client.connect(std.testing.io) catch {
+    client.connect(io) catch {
         client.deinit();
         return error.ConnectionFailed;
     };
     return client;
+}
+
+/// Shared test Io — creates a proper Io.Threaded for integration tests
+/// instead of std.testing.io which is unsuitable for real network I/O.
+fn getTestIo() Io {
+    const state = struct {
+        var instance: ?Io.Threaded = null;
+    };
+    if (state.instance == null) {
+        state.instance = Io.Threaded.init(std.heap.page_allocator, .{});
+    }
+    return state.instance.?.io();
 }
 
 // ─── Basic HTTP Server Tests ────────────────────────────────────
@@ -243,7 +260,7 @@ test "integration: basic GET returns 200 with body" {
     var client = try connectClient(plain_port);
     defer client.deinit();
 
-    var resp = try client.request(std.testing.io, .GET, "/", null, null);
+    var resp = try client.request(getTestIo(), .GET, "/", null, null);
     defer resp.deinit(testing.allocator);
 
     try testing.expectEqual(httpz.Response.StatusCode.ok, resp.status);
@@ -255,7 +272,7 @@ test "integration: GET /json returns application/json" {
     var client = try connectClient(plain_port);
     defer client.deinit();
 
-    var resp = try client.request(std.testing.io, .GET, "/json", null, null);
+    var resp = try client.request(getTestIo(), .GET, "/json", null, null);
     defer resp.deinit(testing.allocator);
 
     try testing.expectEqual(httpz.Response.StatusCode.ok, resp.status);
@@ -268,7 +285,7 @@ test "integration: GET /not-a-route returns 404" {
     var client = try connectClient(plain_port);
     defer client.deinit();
 
-    var resp = try client.request(std.testing.io, .GET, "/nope", null, null);
+    var resp = try client.request(getTestIo(), .GET, "/nope", null, null);
     defer resp.deinit(testing.allocator);
 
     try testing.expectEqual(httpz.Response.StatusCode.not_found, resp.status);
@@ -279,7 +296,7 @@ test "integration: POST with body echoed back" {
     var client = try connectClient(plain_port);
     defer client.deinit();
 
-    var resp = try client.request(std.testing.io, .POST, "/echo", null, "hello from client");
+    var resp = try client.request(getTestIo(), .POST, "/echo", null, "hello from client");
     defer resp.deinit(testing.allocator);
 
     try testing.expectEqual(httpz.Response.StatusCode.ok, resp.status);
@@ -291,7 +308,7 @@ test "integration: redirect returns 302 with Location" {
     var client = try connectClient(plain_port);
     defer client.deinit();
 
-    var resp = try client.request(std.testing.io, .GET, "/redirect", null, null);
+    var resp = try client.request(getTestIo(), .GET, "/redirect", null, null);
     defer resp.deinit(testing.allocator);
 
     try testing.expectEqual(httpz.Response.StatusCode.found, resp.status);
@@ -333,7 +350,7 @@ test "integration: standard headers present (Date, Server)" {
     var client = try connectClient(plain_port);
     defer client.deinit();
 
-    var resp = try client.request(std.testing.io, .GET, "/", null, null);
+    var resp = try client.request(getTestIo(), .GET, "/", null, null);
     defer resp.deinit(testing.allocator);
 
     try testing.expect(resp.headers.get("Date") != null);
@@ -346,7 +363,7 @@ test "integration: Content-Length header is set" {
     var client = try connectClient(plain_port);
     defer client.deinit();
 
-    var resp = try client.request(std.testing.io, .GET, "/", null, null);
+    var resp = try client.request(getTestIo(), .GET, "/", null, null);
     defer resp.deinit(testing.allocator);
 
     try testing.expectEqualStrings("13", resp.headers.get("Content-Length").?);
@@ -373,12 +390,12 @@ test "integration: keep-alive allows multiple requests" {
     var client = try connectClient(plain_port);
     defer client.deinit();
 
-    var resp1 = try client.request(std.testing.io, .GET, "/", null, null);
+    var resp1 = try client.request(getTestIo(), .GET, "/", null, null);
     defer resp1.deinit(testing.allocator);
     try testing.expectEqual(httpz.Response.StatusCode.ok, resp1.status);
     try testing.expectEqualStrings("Hello, World!", resp1.body);
 
-    var resp2 = try client.request(std.testing.io, .GET, "/json", null, null);
+    var resp2 = try client.request(getTestIo(), .GET, "/json", null, null);
     defer resp2.deinit(testing.allocator);
     try testing.expectEqual(httpz.Response.StatusCode.ok, resp2.status);
     try testing.expectEqualStrings("{\"status\":\"ok\"}", resp2.body);
@@ -391,7 +408,7 @@ test "integration: router dispatches to correct handler" {
     var client = try connectClient(router_port);
     defer client.deinit();
 
-    var resp = try client.request(std.testing.io, .GET, "/", null, null);
+    var resp = try client.request(getTestIo(), .GET, "/", null, null);
     defer resp.deinit(testing.allocator);
 
     try testing.expectEqual(httpz.Response.StatusCode.ok, resp.status);
@@ -403,7 +420,7 @@ test "integration: router extracts path parameters" {
     var client = try connectClient(router_port);
     defer client.deinit();
 
-    var resp = try client.request(std.testing.io, .GET, "/users/42", null, null);
+    var resp = try client.request(getTestIo(), .GET, "/users/42", null, null);
     defer resp.deinit(testing.allocator);
 
     try testing.expectEqual(httpz.Response.StatusCode.ok, resp.status);
@@ -415,7 +432,7 @@ test "integration: router POST returns 201 Created" {
     var client = try connectClient(router_port);
     defer client.deinit();
 
-    var resp = try client.request(std.testing.io, .POST, "/users", null, "{}");
+    var resp = try client.request(getTestIo(), .POST, "/users", null, "{}");
     defer resp.deinit(testing.allocator);
 
     try testing.expectEqual(httpz.Response.StatusCode.created, resp.status);
@@ -427,7 +444,7 @@ test "integration: router 404 for unmatched route" {
     var client = try connectClient(router_port);
     defer client.deinit();
 
-    var resp = try client.request(std.testing.io, .GET, "/nonexistent", null, null);
+    var resp = try client.request(getTestIo(), .GET, "/nonexistent", null, null);
     defer resp.deinit(testing.allocator);
 
     try testing.expectEqual(httpz.Response.StatusCode.not_found, resp.status);
@@ -504,7 +521,9 @@ test "integration: streaming large response" {
 
 test "integration: websocket upgrade and echo" {
     ensureRouterServer();
-    const io = std.testing.io;
+    var threaded = Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
 
     const addr = Io.net.IpAddress.parseIp4("127.0.0.1", router_port) catch unreachable;
     const stream = Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch
