@@ -131,8 +131,9 @@ pub fn flushPackets(conn: *Connection) Error!void {
 }
 
 /// Create a QUIC client connection and perform handshake over UDP.
-/// If `stream_ctx` is provided, installs recv_stream_data callback that forwards to nghttp3.
-pub fn connect(host: []const u8, port: u16, stream_ctx: ?StreamDataCtx) Error!Connection {
+/// If `stream_ctx` is provided, installs recv_stream_data callback.
+/// If `early_data` is provided (from a previous connection), enables 0-RTT.
+pub fn connect(host: []const u8, port: u16, stream_ctx: ?StreamDataCtx, early_data: ?[]const u8) Error!Connection {
     const addr = try posix.getAddressList(std.heap.page_allocator, host, port);
     defer addr.deinit();
 
@@ -179,6 +180,7 @@ pub fn connect(host: []const u8, port: u16, stream_ctx: ?StreamDataCtx) Error!Co
         stream_ctx_ptr = ptr;
     }
 
+    // Set QLog if enabled
     var settings: ngtcp2.ngtcp2_settings = undefined;
     ngtcp2.ngtcp2_settings_default(&settings);
     if (qlog_fd >= 0) {
@@ -206,6 +208,11 @@ pub fn connect(host: []const u8, port: u16, stream_ctx: ?StreamDataCtx) Error!Co
     const ret = ngtcp2.ngtcp2_conn_client_new(&conn_ptr, &dcid, &scid, &path, ngtcp2.NGTCP2_PROTO_VER_V1, &callbacks, &settings, &params, user_data, null);
     if (ret != 0) return error.QuicError;
 
+    // Enable 0-RTT early data with remembered transport params
+    if (early_data) |ed| {
+        _ = ngtcp2.ngtcp2_conn_decode_and_set_0rtt_transport_params(conn_ptr.?, ed.ptr, ed.len);
+    }
+
     var self = Connection{
         .conn = conn_ptr.?,
         .socket = sock,
@@ -222,6 +229,17 @@ pub fn connect(host: []const u8, port: u16, stream_ctx: ?StreamDataCtx) Error!Co
     }
 
     return self;
+}
+
+/// Get encoded transport params for 0-RTT resumption.
+/// Returns allocated buffer — caller owns and must free.
+pub fn getTransportParams(conn: *Connection) ![]u8 {
+    var buf: [4096]u8 = undefined;
+    const n = ngtcp2.ngtcp2_conn_encode_0rtt_transport_params(conn.conn, &buf, buf.len);
+    if (n < 0) return error.QuicError;
+    const result = try std.heap.page_allocator.alloc(u8, @intCast(n));
+    @memcpy(result, buf[0..@intCast(n)]);
+    return result;
 }
 
 /// Server-side QUIC listener, binds UDP and routes by Connection ID.

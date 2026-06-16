@@ -19,7 +19,7 @@ pub const Client = struct {
             .h3_conn = @ptrCast(h3.conn),
             .recv_stream_data = onQuicStreamData,
         };
-        var qc = try quic.connect(host, port, stream_ctx);
+        var qc = try quic.connect(host, port, stream_ctx, null);
         errdefer qc.deinit();
 
         return .{
