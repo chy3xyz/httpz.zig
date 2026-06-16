@@ -229,6 +229,15 @@ fn nowNanos() u64 {
     return @as(u64, @intCast(ts.tv_sec)) * 1_000_000_000 + @as(u64, @intCast(ts.tv_nsec));
 }
 
+test "H3 Server init/deinit" {
+    var server = try Server.init(std.testing.allocator, 14433, echoHandler);
+    defer server.deinit();
+}
+
+fn echoHandler(allocator: std.mem.Allocator, _: []const u8) []const u8 {
+    return allocator.dupe(u8, "OK") catch "OK";
+}
+
 test {
     _ = Server;
 }
