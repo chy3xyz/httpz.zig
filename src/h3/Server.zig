@@ -104,7 +104,7 @@ pub const Server = struct {
 
         var conn_ptr: ?*ngtcp2.ngtcp2_conn = null;
         const mem: ?*const ngtcp2.struct_ngtcp2_mem = null;
-        const ret = ngtcp2.ngtcp2_conn_server_new(&conn_ptr, &client_dcid, &server_scid, &path, ngtcp2.NGTCP2_PROTO_VER_V1, &callbacks, &settings, &params, mem, @ptrCast(&self.listener));
+        const ret = ngtcp2.ngtcp2_conn_server_new(&conn_ptr, &client_dcid, &server_scid, &path, ngtcp2.NGTCP2_PROTO_VER_V1, &callbacks, &settings, &params, mem, @as(?*anyopaque, @ptrCast(&self.listener)));
         if (ret != 0) return error.QuicError;
         errdefer ngtcp2.ngtcp2_conn_del(conn_ptr.?);
 
