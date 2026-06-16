@@ -106,6 +106,12 @@ pub const Session = struct {
         if (ret != 0) return error.H3Error;
     }
 
+    /// Bind QPACK encoder and decoder streams to this H3 session.
+    pub fn bindQpackStreams(self: *Session, enc_stream_id: i64, dec_stream_id: i64) !void {
+        const ret = nghttp3.nghttp3_conn_bind_qpack_streams(self.conn, enc_stream_id, dec_stream_id);
+        if (ret != 0) return error.H3Error;
+    }
+
     /// Feed received stream data to nghttp3 for HTTP/3 processing.
     /// Returns number of bytes consumed.
     pub fn readStream(self: *Session, stream_id: i64, data: []const u8, fin: bool) !usize {

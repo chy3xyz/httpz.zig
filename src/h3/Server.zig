@@ -137,9 +137,9 @@ pub const Server = struct {
         defer h3.deinit();
 
         var stream_buf: [65536]u8 = undefined;
-        var qpack_enc_bound = false;
-        var qpack_dec_bound = false;
         var control_bound = false;
+        var qpack_enc_id: i64 = -1;
+        var qpack_dec_id: i64 = -1;
         var requests_served: u32 = 0;
 
         // Poll loop: process incoming packets, bind streams, serve requests
@@ -157,9 +157,9 @@ pub const Server = struct {
                 const data = stream_buf[0..@intCast(sn)];
 
                 if (isUniStream(stream_id)) {
-                    // Unidirectional stream — detect type and bind
                     if (data.len == 0) continue;
                     const stype = data[0];
+                    const rest = if (data.len > 1) data[1..] else data[0..0];
 
                     switch (stype) {
                         H3_STREAM_CONTROL => {
@@ -167,43 +167,29 @@ pub const Server = struct {
                                 _ = nghttp3.nghttp3_conn_bind_control_stream(h3.conn, stream_id);
                                 control_bound = true;
                             }
-                            // Feed remaining data after the type byte
-                            if (data.len > 1) {
-                                _ = h3.readStream(stream_id, data[1..], fin != 0) catch {};
+                            if (rest.len > 0) {
+                                _ = h3.readStream(stream_id, rest, fin != 0) catch {};
                             }
                         },
                         H3_STREAM_QPACK_ENCODER => {
-                            if (!qpack_enc_bound) {
-                                qpack_enc_bound = true;
-                                // Will bind both when decoder is also seen
-                            }
-                            if (qpack_dec_bound and qpack_enc_bound) {
-                                if (control_bound) {
-                                    // Find encoder and decoder stream IDs
-                                    // For now, stream_id is the encoder
-                                    // Decoder is typically stream_id of the decoder stream
-                                    // Bind with placeholder
-                                }
+                            qpack_enc_id = stream_id;
+                            tryBindQpack(&h3, &control_bound, qpack_enc_id, qpack_dec_id);
+                            if (rest.len > 0) {
+                                _ = h3.readStream(stream_id, rest, fin != 0) catch {};
                             }
                         },
                         H3_STREAM_QPACK_DECODER => {
-                            if (!qpack_dec_bound) {
-                                qpack_dec_bound = true;
-                            }
-                            if (qpack_enc_bound and qpack_dec_bound and control_bound) {
-                                // Bind QPACK: find encoder stream (stream_id where stype was 0x02)
-                                // Skip for now — QPACK binding needs both stream IDs
+                            qpack_dec_id = stream_id;
+                            tryBindQpack(&h3, &control_bound, qpack_enc_id, qpack_dec_id);
+                            if (rest.len > 0) {
+                                _ = h3.readStream(stream_id, rest, fin != 0) catch {};
                             }
                         },
-                        else => {
-                            // Unknown unidirectional stream type — ignore
-                        },
+                        else => {},
                     }
                 } else if (isBidiClientStream(stream_id)) {
-                    // Client-initiated bidi stream — HTTP request data
                     _ = h3.readStream(stream_id, data, fin != 0) catch {};
 
-                    // After feeding data, submit response
                     if (fin != 0 and requests_served < 10) {
                         const body = self.handler(self.allocator, "H3-request");
                         h3.submitResponse(stream_id, 200, "", body) catch {};
@@ -213,6 +199,12 @@ pub const Server = struct {
             }
 
             std.time.sleep(5 * std.time.ns_per_ms);
+        }
+    }
+
+    fn tryBindQpack(h3: *http3.Session, control_bound: *bool, enc_id: i64, dec_id: i64) void {
+        if (control_bound.* and enc_id >= 0 and dec_id >= 0) {
+            h3.bindQpackStreams(enc_id, dec_id) catch {};
         }
     }
 
