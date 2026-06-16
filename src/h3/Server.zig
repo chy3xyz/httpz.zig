@@ -61,7 +61,7 @@ pub const Server = struct {
                 continue;
             }
 
-            try self.handleNewConnection(buf, n, dcid, dcid_len);
+            try self.handleNewConnection(&buf, @intCast(n), dcid, dcid_len);
         }
     }
 
@@ -77,8 +77,7 @@ pub const Server = struct {
         client_dcid.datalen = @intCast(@min(dcid_len, @as(usize, 18)));
         @memcpy(client_dcid.data[0..client_dcid.datalen], dcid[0..client_dcid.datalen]);
 
-        var callbacks: ngtcp2.ngtcp2_callbacks = undefined;
-        ngtcp2.ngtcp2_callbacks_default(&callbacks);
+        var callbacks: ngtcp2.ngtcp2_callbacks = std.mem.zeroes(ngtcp2.ngtcp2_callbacks);
         callbacks.recv_client_initial = quic.serverRecvClientInitialCb;
         callbacks.recv_crypto_data = ngtcp2.ngtcp2_crypto_recv_crypto_data_cb;
         callbacks.encrypt = ngtcp2.ngtcp2_crypto_encrypt_cb;
@@ -128,7 +127,9 @@ pub const Server = struct {
             .socket = self.listener.socket,
         };
 
-        try self.listener.connections.put(server_scid.data, conn);
+        var cid_key: [18]u8 = undefined;
+        @memcpy(&cid_key, server_scid.data[0..18]);
+        try self.listener.connections.put(cid_key, conn);
         _ = try quic.flushPackets(conn);
 
         // Drive handshake

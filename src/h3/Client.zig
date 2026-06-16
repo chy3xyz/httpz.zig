@@ -4,6 +4,15 @@ const http3 = @import("http3.zig");
 const ngtcp2 = @import("ngtcp2_c");
 const nghttp3 = @import("nghttp3_c");
 
+/// Sleep for a given number of nanoseconds.
+fn sleepNs(ns: u64) void {
+    const ts = std.posix.timespec{
+        .sec = @intCast(ns / 1_000_000_000),
+        .nsec = @intCast(ns % 1_000_000_000),
+    };
+    _ = std.c.nanosleep(&ts, null);
+}
+
 pub const Client = struct {
     quic_conn: quic.Connection,
     h3_session: http3.Session,
@@ -11,7 +20,7 @@ pub const Client = struct {
     host: []const u8,
 
     pub fn init(allocator: std.mem.Allocator, host: []const u8, port: u16) !Client {
-        const h3 = try http3.Session.init(allocator);
+        var h3 = try http3.Session.init(allocator);
         errdefer h3.deinit();
 
         // Set up stream data bridge: ngtcp2 recv_stream_data → nghttp3 readStream
@@ -46,7 +55,7 @@ pub const Client = struct {
             // Retry: flush, read, sleep
             quic.flushPackets(&self.quic_conn) catch {};
             quic.readPacket(&self.quic_conn) catch {};
-            std.time.sleep(10 * std.time.ns_per_ms);
+            sleepNs(10 * std.time.ns_per_ms);
         }
         if (stream_id < 0) return error.QuicError;
 
@@ -54,12 +63,12 @@ pub const Client = struct {
         try self.h3_session.submitRequest(stream_id, path, self.host);
 
         // 3. Set up response context on the nghttp3 stream
-        var ctx = http3.ResponseContext.init(self.allocator);
+        var ctx = try http3.ResponseContext.init(self.allocator);
         defer ctx.deinit();
         _ = nghttp3.nghttp3_conn_set_stream_user_data(self.h3_session.conn, stream_id, @ptrCast(&ctx));
 
         // 4. I/O loop: pump writes, read responses until done
-        const start = std.time.milliTimestamp();
+        const start = nowNanos();
         while (!ctx.done) {
             // Pump outgoing data: nghttp3 → ngtcp2 → UDP
             pumpWrites(self);
@@ -72,9 +81,9 @@ pub const Client = struct {
             quic.readPacket(&self.quic_conn) catch {};
 
             // Timeout after 30 seconds
-            if (std.time.milliTimestamp() - start > 30000) return error.Timeout;
+            if (nowNanos() - start > 30 * std.time.ns_per_s) return error.Timeout;
 
-            std.time.sleep(1 * std.time.ns_per_ms);
+            sleepNs(1 * std.time.ns_per_ms);
         }
 
         // 5. Return body (copy to heap since ctx is stack-local)
@@ -87,14 +96,14 @@ pub const Client = struct {
 /// Called by quic.zig's recvStreamDataCb whenever stream data arrives.
 fn onQuicStreamData(h3_conn: *anyopaque, stream_id: i64, data: []const u8, fin: bool) void {
     const conn: *nghttp3.nghttp3_conn = @alignCast(@ptrCast(h3_conn));
-    _ = nghttp3.nghttp3_conn_read_stream2(conn, stream_id, data.ptr, data.len, @intFromBool(fin));
+    _ = nghttp3.nghttp3_conn_read_stream2(conn, stream_id, data.ptr, data.len, @intFromBool(fin), 0);
 }
 
 /// Pump pending HTTP/3 write data (headers, etc.) into the QUIC connection.
 fn pumpWrites(self: *Client) void {
     while (true) {
         var write_stream_id: i64 = -1;
-        var write_fin: nghttp3.c_int = 0;
+        var write_fin: c_int = 0;
         var vec: nghttp3.nghttp3_vec = undefined;
         const nvec = nghttp3.nghttp3_conn_writev_stream(self.h3_session.conn, &write_stream_id, &write_fin, &vec, 1);
         if (nvec < 0) break;
@@ -126,8 +135,8 @@ fn pumpWrites(self: *Client) void {
 
 fn nowNanos() u64 {
     var ts: std.posix.timespec = undefined;
-    std.posix.clock_gettime(std.posix.CLOCK.MONOTONIC, &ts) catch unreachable;
-    return @as(u64, @intCast(ts.tv_sec)) * 1_000_000_000 + @as(u64, @intCast(ts.tv_nsec));
+    _ = std.c.clock_gettime(std.posix.CLOCK.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
 }
 
 test {

@@ -14,17 +14,17 @@ pub const ResponseContext = struct {
     done: bool = false,
     allocator: std.mem.Allocator,
 
-    pub fn init(allocator: std.mem.Allocator) ResponseContext {
+    pub fn init(allocator: std.mem.Allocator) !ResponseContext {
         return .{
-            .headers = std.ArrayList(u8).init(allocator),
-            .body = std.ArrayList(u8).init(allocator),
+            .headers = try std.ArrayList(u8).initCapacity(allocator, 0),
+            .body = try std.ArrayList(u8).initCapacity(allocator, 0),
             .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *ResponseContext) void {
-        self.headers.deinit();
-        self.body.deinit();
+        self.headers.deinit(self.allocator);
+        self.body.deinit(self.allocator);
     }
 };
 
@@ -42,7 +42,7 @@ pub const Session = struct {
         callbacks.end_stream = endStreamCb;
 
         var conn_ptr: ?*nghttp3.nghttp3_conn = null;
-        const ret = nghttp3.nghttp3_conn_client_new(&conn_ptr, &callbacks, null, null);
+        const ret = nghttp3.nghttp3_conn_client_new(&conn_ptr, &callbacks, null, null, null);
         if (ret != 0) return error.H3Error;
 
         return .{
@@ -132,13 +132,13 @@ fn recvHeaderCb(
     stream_user_data: ?*anyopaque,
 ) callconv(.c) c_int {
     if (stream_user_data) |ud| {
-        const ctx: *ResponseContext = @alignCast(@ptrCast(ud));
+        var mutable_ctx: *ResponseContext = @alignCast(@ptrCast(ud));
         const nv = nghttp3.nghttp3_rcbuf_get_buf(name.?);
         const vv = nghttp3.nghttp3_rcbuf_get_buf(value.?);
-        ctx.headers.appendSlice(nv.base[0..nv.len]) catch return @intFromEnum(nghttp3.NGHTTP3_ERR_CALLBACK_FAILURE);
-        ctx.headers.appendSlice(": ") catch return @intFromEnum(nghttp3.NGHTTP3_ERR_CALLBACK_FAILURE);
-        ctx.headers.appendSlice(vv.base[0..vv.len]) catch return @intFromEnum(nghttp3.NGHTTP3_ERR_CALLBACK_FAILURE);
-        ctx.headers.appendSlice("\r\n") catch return @intFromEnum(nghttp3.NGHTTP3_ERR_CALLBACK_FAILURE);
+        mutable_ctx.headers.appendSlice(mutable_ctx.allocator, nv.base[0..nv.len]) catch return nghttp3.NGHTTP3_ERR_CALLBACK_FAILURE;
+        mutable_ctx.headers.appendSlice(mutable_ctx.allocator, ": ") catch return nghttp3.NGHTTP3_ERR_CALLBACK_FAILURE;
+        mutable_ctx.headers.appendSlice(mutable_ctx.allocator, vv.base[0..vv.len]) catch return nghttp3.NGHTTP3_ERR_CALLBACK_FAILURE;
+        mutable_ctx.headers.appendSlice(mutable_ctx.allocator, "\r\n") catch return nghttp3.NGHTTP3_ERR_CALLBACK_FAILURE;
     }
     return 0;
 }
@@ -152,8 +152,8 @@ fn recvDataCb(
     stream_user_data: ?*anyopaque,
 ) callconv(.c) c_int {
     if (stream_user_data) |ud| {
-        const ctx: *ResponseContext = @alignCast(@ptrCast(ud));
-        ctx.body.appendSlice(data[0..datalen]) catch return @intFromEnum(nghttp3.NGHTTP3_ERR_CALLBACK_FAILURE);
+        var mutable_ctx: *ResponseContext = @alignCast(@ptrCast(ud));
+        mutable_ctx.body.appendSlice(mutable_ctx.allocator, data[0..datalen]) catch return nghttp3.NGHTTP3_ERR_CALLBACK_FAILURE;
     }
     return 0;
 }
