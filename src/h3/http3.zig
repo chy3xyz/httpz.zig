@@ -37,6 +37,11 @@ pub const Session = struct {
         var callbacks: nghttp3.nghttp3_callbacks = undefined;
         nghttp3.nghttp3_callbacks_default(&callbacks);
 
+        // Set response accumulation callbacks
+        callbacks.recv_header = recvHeaderCb;
+        callbacks.recv_data = recvDataCb;
+        callbacks.end_stream = endStreamCb;
+
         var conn_ptr: ?*nghttp3.nghttp3_conn = null;
         const ret = nghttp3.nghttp3_conn_client_new(&conn_ptr, &callbacks, null, null);
         if (ret != 0) return error.H3Error;
@@ -69,7 +74,7 @@ pub const Session = struct {
     }
 
     /// Submit an HTTP/3 response on a QUIC stream (server-side).
-    pub fn submitResponse(self: *Session, stream_id: i64, status: u16, headers: []const u8, body: []const u8) !void {
+    pub fn submitResponse(self: *Session, stream_id: i64, status: u16, _: []const u8, _: []const u8) !void {
         var status_buf: [16]u8 = undefined;
         const status_str = std.fmt.bufPrint(&status_buf, "{d}", .{status}) catch return error.H3Error;
 
@@ -79,8 +84,6 @@ pub const Session = struct {
 
         const ret = nghttp3.nghttp3_conn_submit_response(self.conn, stream_id, &nva, nva.len, null);
         if (ret != 0) return error.H3Error;
-        _ = headers;
-        _ = body;
     }
 
     /// Feed received stream data to nghttp3 for HTTP/3 processing.
@@ -91,6 +94,58 @@ pub const Session = struct {
         return @intCast(consumed);
     }
 };
+
+// ---- nghttp3 callback implementations ----
+
+fn recvHeaderCb(
+    _: ?*nghttp3.nghttp3_conn,
+    _: i64,
+    _: i32,
+    name: ?*nghttp3.nghttp3_rcbuf,
+    value: ?*nghttp3.nghttp3_rcbuf,
+    _: u8,
+    _: ?*anyopaque,
+    stream_user_data: ?*anyopaque,
+) callconv(.c) nghttp3.c_int {
+    if (stream_user_data) |ud| {
+        const ctx: *ResponseContext = @alignCast(@ptrCast(ud));
+        const nv = nghttp3.nghttp3_rcbuf_get_buf(name.?);
+        const vv = nghttp3.nghttp3_rcbuf_get_buf(value.?);
+        ctx.headers.appendSlice(nv.base[0..nv.len]) catch return @intFromEnum(nghttp3.NGHTTP3_ERR_CALLBACK_FAILURE);
+        ctx.headers.appendSlice(": ") catch return @intFromEnum(nghttp3.NGHTTP3_ERR_CALLBACK_FAILURE);
+        ctx.headers.appendSlice(vv.base[0..vv.len]) catch return @intFromEnum(nghttp3.NGHTTP3_ERR_CALLBACK_FAILURE);
+        ctx.headers.appendSlice("\r\n") catch return @intFromEnum(nghttp3.NGHTTP3_ERR_CALLBACK_FAILURE);
+    }
+    return 0;
+}
+
+fn recvDataCb(
+    _: ?*nghttp3.nghttp3_conn,
+    _: i64,
+    data: [*c]const u8,
+    datalen: usize,
+    _: ?*anyopaque,
+    stream_user_data: ?*anyopaque,
+) callconv(.c) nghttp3.c_int {
+    if (stream_user_data) |ud| {
+        const ctx: *ResponseContext = @alignCast(@ptrCast(ud));
+        ctx.body.appendSlice(data[0..datalen]) catch return @intFromEnum(nghttp3.NGHTTP3_ERR_CALLBACK_FAILURE);
+    }
+    return 0;
+}
+
+fn endStreamCb(
+    _: ?*nghttp3.nghttp3_conn,
+    _: i64,
+    _: ?*anyopaque,
+    stream_user_data: ?*anyopaque,
+) callconv(.c) nghttp3.c_int {
+    if (stream_user_data) |ud| {
+        const ctx: *ResponseContext = @alignCast(@ptrCast(ud));
+        ctx.done = true;
+    }
+    return 0;
+}
 
 /// Create an nghttp3_nv (name-value pair) for header submission.
 fn makeNv(name: []const u8, value: []const u8) nghttp3.nghttp3_nv {
