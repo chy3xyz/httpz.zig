@@ -83,6 +83,9 @@ pub const Server = struct {
 
         var settings: ngtcp2.ngtcp2_settings = undefined;
         ngtcp2.ngtcp2_settings_default(&settings);
+        if (quic.qlog_fd >= 0) {
+            settings.qlog_write = quic.qlogWriteCb;
+        }
 
         var params: ngtcp2.ngtcp2_transport_params = undefined;
         ngtcp2.ngtcp2_transport_params_default(&params);

@@ -6,6 +6,37 @@ const NGTCP2_STREAM_DATA_FLAG_FIN = ngtcp2.NGTCP2_STREAM_DATA_FLAG_FIN;
 
 const max_datagram_size = 65536;
 
+/// Thread-local QLog file descriptor. Set by enableQLog before creating connections.
+pub threadlocal var qlog_fd: posix.fd_t = -1;
+
+pub fn qlogWriteCb(
+    user_data: ?*anyopaque,
+    _: u32,
+    data: ?*const anyopaque,
+    datalen: usize,
+) callconv(.c) void {
+    _ = user_data;
+    if (qlog_fd < 0) return;
+    if (data) |d| {
+        _ = posix.write(qlog_fd, @as([*]const u8, @ptrCast(d))[0..datalen]) catch {};
+    }
+}
+
+/// Enable QLog debugging output to the given file path.
+/// Must be called BEFORE creating QUIC connections.
+pub fn enableQLog(path: []const u8) !void {
+    const fd = try posix.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+    qlog_fd = fd;
+}
+
+/// Disable QLog and close the file.
+pub fn disableQLog() void {
+    if (qlog_fd >= 0) {
+        _ = posix.close(qlog_fd);
+        qlog_fd = -1;
+    }
+}
+
 pub const Error = error{QuicError};
 
 /// Callback type for receiving stream data. Called from ngtcp2 recv_stream_data.
@@ -20,12 +51,16 @@ pub const Connection = struct {
     socket: posix.fd_t,
     buf: [max_datagram_size]u8 = undefined,
     stream_ctx_alloc: ?*StreamDataCtx = null,
+    qlog_fd: ?posix.fd_t = null,
 
     pub fn deinit(self: *Connection) void {
         ngtcp2.ngtcp2_conn_del(self.conn);
         posix.close(self.socket);
         if (self.stream_ctx_alloc) |ptr| {
             std.heap.page_allocator.destroy(ptr);
+        }
+        if (self.qlog_fd) |fd| {
+            _ = posix.close(fd);
         }
         self.* = undefined;
     }
@@ -146,6 +181,9 @@ pub fn connect(host: []const u8, port: u16, stream_ctx: ?StreamDataCtx) Error!Co
 
     var settings: ngtcp2.ngtcp2_settings = undefined;
     ngtcp2.ngtcp2_settings_default(&settings);
+    if (qlog_fd >= 0) {
+        settings.qlog_write = qlogWriteCb;
+    }
 
     var params: ngtcp2.ngtcp2_transport_params = undefined;
     ngtcp2.ngtcp2_transport_params_default(&params);
