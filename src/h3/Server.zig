@@ -246,6 +246,12 @@ test "H3 Server init/deinit" {
     defer server.deinit();
 }
 
+test "H3: TLS cert loading" {
+    const cert_pem = @embedFile("test_cert.pem");
+    const key_pem = @embedFile("test_key.pem");
+    try quic.setServerCert(cert_pem, key_pem);
+}
+
 fn echoHandler(allocator: std.mem.Allocator, _: []const u8) []const u8 {
     return allocator.dupe(u8, "OK") catch "OK";
 }
