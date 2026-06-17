@@ -4,13 +4,22 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Include paths — configurable via -D flags for cross-platform support.
+    // Defaults work for macOS Homebrew. Override for Linux/pkg-config paths.
+    const openssl_include = b.option([]const u8, "openssl-include",
+        "Path to OpenSSL include directory") orelse "/opt/homebrew/opt/openssl@3/include";
+    const ngtcp2_include = b.option([]const u8, "ngtcp2-include",
+        "Path to ngtcp2 include directory") orelse "/opt/homebrew/opt/libngtcp2/include";
+    const nghttp3_include = b.option([]const u8, "nghttp3-include",
+        "Path to nghttp3 include directory") orelse "/opt/homebrew/opt/libnghttp3/include";
+
     // Translate C headers for OpenSSL
     const openssl_c = b.addTranslateC(.{
         .root_source_file = b.path("src/openssl.h"),
         .target = target,
         .optimize = optimize,
     });
-    openssl_c.addIncludePath(.{ .cwd_relative = "/opt/homebrew/opt/openssl@3/include" });
+    openssl_c.addIncludePath(.{ .cwd_relative = openssl_include });
     const openssl_c_mod = openssl_c.createModule();
 
     // Translate C headers for HTTP/3 (ngtcp2 + nghttp3)
@@ -19,8 +28,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    ngtcp2_h.addIncludePath(.{ .cwd_relative = "/opt/homebrew/opt/libngtcp2/include" });
-    ngtcp2_h.addIncludePath(.{ .cwd_relative = "/opt/homebrew/opt/openssl@3/include" });
+    ngtcp2_h.addIncludePath(.{ .cwd_relative = ngtcp2_include });
+    ngtcp2_h.addIncludePath(.{ .cwd_relative = openssl_include });
     const ngtcp2_mod = ngtcp2_h.createModule();
 
     const nghttp3_h = b.addTranslateC(.{
@@ -28,7 +37,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    nghttp3_h.addIncludePath(.{ .cwd_relative = "/opt/homebrew/opt/libnghttp3/include" });
+    nghttp3_h.addIncludePath(.{ .cwd_relative = nghttp3_include });
     const nghttp3_mod = nghttp3_h.createModule();
 
     // Library module
@@ -101,7 +110,7 @@ pub fn build(b: *std.Build) void {
 
     const run_integration_tests = b.addRunArtifact(integration_tests);
 
-    // Integration test step (separate because they use networking)
+    // Integration test step
     const integration_step = b.step("test-integration", "Run integration tests");
     integration_step.dependOn(&run_integration_tests.step);
 
@@ -113,7 +122,6 @@ pub fn build(b: *std.Build) void {
     // Coverage step using kcov
     const coverage_step = b.step("coverage", "Run tests with kcov code coverage");
 
-    // Module tests cover everything via refAllDecls in root.zig
     const cov_mod_test = b.addTest(.{
         .root_module = httpz_mod,
         .use_llvm = true,
@@ -125,5 +133,4 @@ pub fn build(b: *std.Build) void {
     kcov_mod.addArg("kcov-output");
     kcov_mod.addArtifactArg(cov_mod_test);
     coverage_step.dependOn(&kcov_mod.step);
-
 }
