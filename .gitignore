@@ -8,3 +8,4 @@ deps/
 # Generated local TLS certificates
 /cert/
 examples/cert/*.pem
+.DS_Store
