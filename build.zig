@@ -4,14 +4,12 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const h3 = b.option(bool, "h3", "Enable HTTP/3 support (requires nghttp3 and ngtcp2)") orelse true;
+
     // Include paths — configurable via -D flags for cross-platform support.
     // Defaults work for macOS Homebrew. Override for Linux/pkg-config paths.
     const openssl_include = b.option([]const u8, "openssl-include",
         "Path to OpenSSL include directory") orelse "/opt/homebrew/opt/openssl@3/include";
-    const ngtcp2_include = b.option([]const u8, "ngtcp2-include",
-        "Path to ngtcp2 include directory") orelse "/opt/homebrew/opt/libngtcp2/include";
-    const nghttp3_include = b.option([]const u8, "nghttp3-include",
-        "Path to nghttp3 include directory") orelse "/opt/homebrew/opt/libnghttp3/include";
 
     // Translate C headers for OpenSSL
     const openssl_c = b.addTranslateC(.{
@@ -22,38 +20,55 @@ pub fn build(b: *std.Build) void {
     openssl_c.addIncludePath(.{ .cwd_relative = openssl_include });
     const openssl_c_mod = openssl_c.createModule();
 
-    // Translate C headers for HTTP/3 (ngtcp2 + nghttp3)
-    const ngtcp2_h = b.addTranslateC(.{
-        .root_source_file = b.path("src/h3/ngtcp2.h"),
-        .target = target,
-        .optimize = optimize,
-    });
-    ngtcp2_h.addIncludePath(.{ .cwd_relative = ngtcp2_include });
-    ngtcp2_h.addIncludePath(.{ .cwd_relative = openssl_include });
-    const ngtcp2_mod = ngtcp2_h.createModule();
+    // Build options exposed to source code.
+    const options = b.addOptions();
+    options.addOption(bool, "h3", h3);
 
-    const nghttp3_h = b.addTranslateC(.{
-        .root_source_file = b.path("src/h3/nghttp3.h"),
-        .target = target,
-        .optimize = optimize,
-    });
-    nghttp3_h.addIncludePath(.{ .cwd_relative = nghttp3_include });
-    const nghttp3_mod = nghttp3_h.createModule();
+    var imports: std.ArrayList(std.Build.Module.Import) = .empty;
+    imports.append(b.allocator, .{ .name = "openssl_c", .module = openssl_c_mod }) catch @panic("OOM");
+    imports.append(b.allocator, .{ .name = "httpz_options", .module = options.createModule() }) catch @panic("OOM");
+
+    // Translate C headers for HTTP/3 (ngtcp2 + nghttp3)
+    if (h3) {
+        const ngtcp2_include = b.option([]const u8, "ngtcp2-include",
+            "Path to ngtcp2 include directory") orelse "/opt/homebrew/opt/libngtcp2/include";
+        const nghttp3_include = b.option([]const u8, "nghttp3-include",
+            "Path to nghttp3 include directory") orelse "/opt/homebrew/opt/libnghttp3/include";
+
+        const ngtcp2_h = b.addTranslateC(.{
+            .root_source_file = b.path("src/h3/ngtcp2.h"),
+            .target = target,
+            .optimize = optimize,
+        });
+        ngtcp2_h.addIncludePath(.{ .cwd_relative = ngtcp2_include });
+        ngtcp2_h.addIncludePath(.{ .cwd_relative = openssl_include });
+        const ngtcp2_mod = ngtcp2_h.createModule();
+
+        const nghttp3_h = b.addTranslateC(.{
+            .root_source_file = b.path("src/h3/nghttp3.h"),
+            .target = target,
+            .optimize = optimize,
+        });
+        nghttp3_h.addIncludePath(.{ .cwd_relative = nghttp3_include });
+        const nghttp3_mod = nghttp3_h.createModule();
+
+        imports.append(b.allocator, .{ .name = "ngtcp2_c", .module = ngtcp2_mod }) catch @panic("OOM");
+        imports.append(b.allocator, .{ .name = "nghttp3_c", .module = nghttp3_mod }) catch @panic("OOM");
+    }
 
     // Library module
     const httpz_mod = b.addModule("httpz", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
-        .imports = &.{
-            .{ .name = "openssl_c", .module = openssl_c_mod },
-            .{ .name = "ngtcp2_c", .module = ngtcp2_mod },
-            .{ .name = "nghttp3_c", .module = nghttp3_mod },
-        },
+        .optimize = optimize,
+        .imports = imports.toOwnedSlice(b.allocator) catch @panic("OOM"),
     });
     httpz_mod.linkSystemLibrary("ssl", .{});
     httpz_mod.linkSystemLibrary("crypto", .{});
-    httpz_mod.linkSystemLibrary("ngtcp2", .{});
-    httpz_mod.linkSystemLibrary("nghttp3", .{});
+    if (h3) {
+        httpz_mod.linkSystemLibrary("ngtcp2", .{});
+        httpz_mod.linkSystemLibrary("nghttp3", .{});
+    }
     httpz_mod.link_libc = true;
 
     // Example executables
@@ -110,7 +125,7 @@ pub fn build(b: *std.Build) void {
 
     const run_integration_tests = b.addRunArtifact(integration_tests);
 
-    // Integration test step
+    // Integration test step (separate because they use networking)
     const integration_step = b.step("test-integration", "Run integration tests");
     integration_step.dependOn(&run_integration_tests.step);
 
